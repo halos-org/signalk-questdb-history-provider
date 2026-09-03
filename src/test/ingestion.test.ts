@@ -700,7 +700,7 @@ describe("flattening objects", () => {
     );
   });
 
-  it("drops null and undefined leaves", () => {
+  it("keeps the leaf with a value and skips null and undefined members", () => {
     assert.deepEqual(
       paths(
         one(

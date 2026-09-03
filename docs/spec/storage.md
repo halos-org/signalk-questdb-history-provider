@@ -162,7 +162,7 @@ CREATE TABLE IF NOT EXISTS signalk_position (
 
 ### Schema repair
 
-19. Purpose: QuestDB's ILP ingestion auto-creates a missing table and names its designated timestamp `timestamp`, while the owned schema and every query use `ts`. If an owned table is dropped while the plugin writes, the next ILP flush recreates it in that wrong shape: rows ingest, but every query filtering on `ts` fails and history reads nothing. The repair detects that shape and rebuilds the table.
+19. Purpose: when a write over ILP reaches QuestDB for a table that does not exist, QuestDB creates the table itself and names the designated timestamp column `timestamp`. The owned schema and every query in this plugin use `ts`, so a table in that shape accepts rows that no history read can return. The window for this is an owned table dropped while the plugin is writing. The repair detects the shape and rebuilds the table.
 20. For each owned table in the fixed order the plugin sends the introspection query `SELECT "column" FROM table_columns('<table>') WHERE designated = true`. The column reference `"column"` is double-quoted because `column` is a keyword in QuestDB.
 21. The designated timestamp is the first cell of the first result row. A result with no rows means the table is missing or has no designated timestamp.
 22. A mismatch exists when a designated timestamp is present and is not `ts`. A missing table is not a mismatch (the DDL creates it correctly). A table with no designated timestamp is not a mismatch. An error from the introspection query (table does not exist, introspection unavailable, transport failure) is swallowed and counts as no mismatch.

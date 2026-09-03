@@ -96,7 +96,10 @@ describe("schema", () => {
   });
 
   it("has no promoteToDefaultProvider property", () => {
-    assert.ok(!("promoteToDefaultProvider" in ConfigSchema.properties));
+    assert.equal(
+      Object.hasOwn(ConfigSchema.properties, "promoteToDefaultProvider"),
+      false,
+    );
   });
 });
 

@@ -589,7 +589,7 @@ describe("string-table fallback", () => {
     assert.ok(f.sqls.some((s) => s.includes("signalk_str")));
   });
 
-  it("does not query the string table when numeric rows exist", async () => {
+  it("issues no string-table query while numeric rows are present", async () => {
     const f = fixture(() => [[TS, 4.2]]);
     const r = await f.provider.getValues(
       self({}, { path: "environment.depth.belowKeel" }),

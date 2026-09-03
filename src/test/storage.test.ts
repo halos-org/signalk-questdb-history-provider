@@ -93,7 +93,7 @@ describe("table creation", () => {
     assert.ok(position.includes("DEDUP UPSERT KEYS(ts, context, source)"));
   });
 
-  it("gives signalk_str a value_kind column", async () => {
+  it("declares value_kind on signalk_str", async () => {
     const sql = scriptedSql();
     await createTables(sql);
     assert.ok(sql.statements[1].includes("value_kind"));

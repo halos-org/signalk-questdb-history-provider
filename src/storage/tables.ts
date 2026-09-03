@@ -66,9 +66,10 @@ export const introspectionQuery = (table: Table): string =>
   `SELECT "column" FROM table_columns('${table}') WHERE designated = true`;
 
 /**
- * Rebuilds any owned table whose designated timestamp is not `ts`. ILP
- * auto-creates a missing table with `timestamp` as its designated column,
- * which every query here would then fail against.
+ * Rebuilds any owned table whose designated timestamp is not `ts`. That shape
+ * appears when a write reaches QuestDB before the table exists: QuestDB then
+ * creates it on its own with `timestamp` as the designated column, and no
+ * query in this plugin can read it.
  *
  * `sql` is read for every statement. The lifecycle drops the client at stop,
  * and a pass that is in flight then fails at its next statement and ends.
