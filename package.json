@@ -1,0 +1,56 @@
+{
+  "name": "signalk-questdb-history-provider",
+  "version": "2.0.1",
+  "type": "module",
+  "description": "",
+  "keywords": [
+    "signalk-node-server-plugin",
+    "signalk-category-database"
+  ],
+  "signalk": {
+    "displayName": "DISPLAY_NAME",
+    "appIcon": "app-icon.svg"
+  },
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc",
+    "watch": "tsc --watch",
+    "prettier": "prettier --write .",
+    "lint": "eslint --fix",
+    "format": "npm run prettier && npm run lint",
+    "ci-lint": "eslint && prettier --check .",
+    "test": "node --test 'dist/test/**/*.test.js'",
+    "build:all": "npm run build && npm test",
+    "prepublishOnly": "npm run build"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "author": "Matti Airas <matti.airas@hatlabs.fi>",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/halos-org/signalk-questdb-history-provider"
+  },
+  "dependencies": {
+    "@js-temporal/polyfill": "^0.5.0",
+    "minimatch": "^10.2.3",
+    "typebox": "^1.3.11"
+  },
+  "devDependencies": {
+    "@eslint/js": "^10.0.1",
+    "@signalk/server-api": "latest",
+    "@types/node": "^22.0.0",
+    "eslint": "^10.2.0",
+    "eslint-config-prettier": "^10.1.8",
+    "globals": "^17.4.0",
+    "jiti": "^2.7.0",
+    "prettier": "^3.9.0",
+    "typescript": "^6.0.3",
+    "typescript-eslint": "^8.58.0"
+  },
+  "bugs": {
+    "url": "https://github.com/halos-org/signalk-questdb-history-provider/issues"
+  },
+  "homepage": "https://github.com/halos-org/signalk-questdb-history-provider#readme"
+}

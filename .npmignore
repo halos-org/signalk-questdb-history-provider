@@ -1,0 +1,13 @@
+src/
+.github/
+*.tsbuildinfo
+.DS_Store
+eslint.config.ts
+tsconfig.json
+
+# Repo scaffolding, not package contents.
+VERSION
+.bumpversion.cfg
+run
+.coderabbit.yaml
+.prettierignore

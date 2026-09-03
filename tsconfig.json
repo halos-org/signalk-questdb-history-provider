@@ -1,0 +1,32 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+
+    // The package is "type": "module", so the emitted dist/ must be real ESM.
+    // nodenext resolution is what makes tsc enforce Node's actual ESM rules —
+    // notably that relative imports carry the emitted `.js` extension. Under
+    // "bundler" resolution tsc accepts extensionless specifiers and emits them
+    // verbatim, which Node then rejects at load with ERR_MODULE_NOT_FOUND.
+    "module": "nodenext",
+    "moduleResolution": "nodenext",
+
+    // Declared, not inherited. Node's globals used to reach this compile only
+    // as a transitive dependency of @types/express, which the code pulled in
+    // for one router type -- so removing that import silently took NodeJS,
+    // Buffer and every node: module with it. Automatic @types inclusion does
+    // not cover it here.
+    "types": ["node"],
+
+    "outDir": "dist",
+    "rootDir": "src",
+    "strict": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "forceConsistentCasingInFileNames": true,
+    "resolveJsonModule": true,
+    "declaration": true,
+    "sourceMap": true
+  },
+  "include": ["src"],
+  "exclude": ["node_modules", "dist"]
+}

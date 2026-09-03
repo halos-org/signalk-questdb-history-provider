@@ -1,0 +1,166 @@
+# Boots a real Signal K server with a real QuestDB and checks the plugin is
+# both loaded and serving. Nothing else here covers that: the unit suites run
+# compiled modules in isolation, and package-e2e asserts the tarball's shape and
+# that Node can import the entry point -- not that signalk-server discovers the
+# package as a plugin, nor that it registers as a history provider once its
+# database answers.
+#
+# This replaces a call to SignalK/signalk-server's plugin-ci.yml. That workflow
+# hard-codes os: [ubuntu-latest, ubuntu-24.04-arm, macos-latest, windows-latest]
+# with no input to narrow it, and this plugin only ever runs on Linux -- HaLOS
+# devices are arm64 Debian. Keeping the call would have meant keeping four
+# platforms to get the one job worth having.
+
+name: Signal K Integration
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# This runs repo scripts and installs third-party packages; it needs nothing
+# but the source.
+permissions:
+  contents: read
+
+jobs:
+  integration:
+    name: signalk-server ${{ matrix.signalk-server-version }} / Node ${{ matrix.node }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        node: ["22", "24"]
+        signalk-server-version: ["latest"]
+
+    services:
+      questdb:
+        image: questdb/questdb:10.0.0
+        ports:
+          - 9000:9000
+          - 9009:9009
+          - 8812:8812
+
+    steps:
+      - name: Checkout plugin
+        uses: actions/checkout@v6
+
+      - name: Setup Node.js ${{ matrix.node }}
+        uses: actions/setup-node@v6
+        with:
+          node-version: ${{ matrix.node }}
+          cache: ${{ hashFiles('package-lock.json') != '' && 'npm' || '' }}
+
+      - name: Wait for QuestDB
+        run: |
+          for _ in $(seq 1 60); do
+            if curl -sf http://localhost:9000/ > /dev/null 2>&1; then
+              echo "QuestDB is up"; exit 0
+            fi
+            sleep 2
+          done
+          echo "::error::QuestDB did not become ready"; exit 1
+
+      - name: Build and pack the plugin
+        run: |
+          if [ -f package-lock.json ]; then npm ci; else npm install; fi
+          npm run build
+          echo "PLUGIN_TGZ=$(npm pack --ignore-scripts --pack-destination /tmp)" >> "$GITHUB_ENV"
+
+      - name: Install signalk-server and the plugin
+        run: |
+          mkdir -p /tmp/sk-test && cd /tmp/sk-test
+          npm init -y > /dev/null
+          npm install signalk-server@${{ matrix.signalk-server-version }}
+          # basename defensively: some npm versions emit a path-prefixed name.
+          npm install "/tmp/$(basename "$PLUGIN_TGZ")"
+
+      - name: Enable the plugin against the service container
+        run: |
+          cd /tmp/sk-test
+          mkdir -p plugin-config-data
+          # The plugin id is declared in the plugin's own code, not derived from
+          # the package name, so it is read back rather than assumed.
+          PLUGIN_ID=$(node -p "require('/tmp/sk-test/node_modules/signalk-questdb-history-provider/dist/plugin-id.js').PLUGIN_ID")
+          echo "PLUGIN_ID=$PLUGIN_ID" >> "$GITHUB_ENV"
+          cat > "plugin-config-data/${PLUGIN_ID}.json" <<JSON
+          {
+            "enabled": true,
+            "configuration": {
+              "questdbHost": "127.0.0.1",
+              "questdbHttpPort": 9000,
+              "questdbIlpPort": 9009
+            }
+          }
+          JSON
+
+      - name: Start the server and verify the plugin
+        env:
+          # How the server finds plugin-config-data/. Without it the config
+          # written above is never read and the plugin stays disabled, which
+          # would fail this job for the wrong reason.
+          SIGNALK_NODE_CONFIG_DIR: /tmp/sk-test
+        run: |
+          cd /tmp/sk-test
+          # Sample data so deltas actually flow: the plugin only writes to
+          # QuestDB when something arrives, and registration follows the write
+          # path being live.
+          npx signalk-server --sample-nmea0183-data --sample-n2k-data \
+            --override-timestamps -p 3000 > /tmp/sk.log 2>&1 &
+          echo $! > /tmp/sk.pid
+
+          for _ in $(seq 1 60); do
+            curl -sf http://localhost:3000/signalk/v1/api/ > /dev/null 2>&1 && break
+            sleep 2
+          done
+          curl -sf http://localhost:3000/signalk/v1/api/ > /dev/null || {
+            echo "::error::signalk-server did not start"; cat /tmp/sk.log; exit 1; }
+
+          echo "--- loaded plugins ---"
+          PLUGINS=$(curl -sf http://localhost:3000/skServer/plugins)
+          echo "$PLUGINS" | node -e 'JSON.parse(require("fs").readFileSync(0,"utf8")).forEach(p=>console.log(p.id))'
+          echo "$PLUGINS" | grep -q "$PLUGIN_ID" || {
+            echo "::error::the server did not load the plugin"; cat /tmp/sk.log; exit 1; }
+
+          # The point of the plugin. Registration happens only after QuestDB
+          # answers and the tables exist, so this covers the whole path rather
+          # than just the package being importable. Retried: the plugin waits
+          # for the database before it registers.
+          echo "--- history providers ---"
+          for _ in $(seq 1 30); do
+            PROVIDERS=$(curl -sf http://localhost:3000/signalk/v2/api/history/_providers || echo '{}')
+            echo "$PROVIDERS" | grep -q "$PLUGIN_ID" && { echo "$PROVIDERS"; exit 0; }
+            sleep 2
+          done
+          echo "::error::the plugin never registered as a history provider"
+          echo "last seen: $PROVIDERS"
+          cat /tmp/sk.log
+          exit 1
+
+      - name: Stop the server
+        if: always()
+        run: kill "$(cat /tmp/sk.pid)" 2>/dev/null || true
+
+      - name: Server log
+        if: failure()
+        run: tail -200 /tmp/sk.log || true
+
+  # A stable name for branch protection to require. The matrix job names carry
+  # their matrix values ("signalk-server latest / Node 22"), so requiring those
+  # directly means every matrix edit silently blocks every PR on a context that
+  # will never report again.
+  integration-status:
+    name: Integration status
+    if: always()
+    needs: [integration]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check the matrix result
+        run: |
+          echo "integration: ${{ needs.integration.result }}"
+          # skipped and cancelled are not success. Only success passes.
+          [ "${{ needs.integration.result }}" = "success" ] || {
+            echo "::error::the Signal K integration matrix did not succeed"; exit 1; }

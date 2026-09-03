@@ -1,0 +1,184 @@
+# ILP wire format and write connection
+
+## Purpose
+
+The plugin records every accepted sample by sending InfluxDB line protocol (ILP) text to QuestDB over a plain TCP socket. This surface is the byte stream on that socket and the behaviour of the connection that carries it: the exact line for each of the three tables, how lines are batched into writes, what is retained while QuestDB is unreachable, how the connection is re-established, and how a persistently failing connection is shown on the plugin's status card. Table creation and every SQL statement belong to another surface.
+
+## Interface constants
+
+### Wire
+
+| Constant                    | Value                                                        |
+| --------------------------- | ------------------------------------------------------------ |
+| Transport                   | TCP, one connection, client side only                        |
+| Default ILP port            | `9009` (configuration surface)                               |
+| Encoding                    | UTF-8                                                        |
+| Line terminator             | one `\n` (0x0A); no `\r`                                     |
+| Numeric table measurement   | `signalk`                                                    |
+| String table measurement    | `signalk_str`                                                |
+| Position table measurement  | `signalk_position`                                           |
+| Tag keys, in emission order | `path`, `context`, `source`, `value_kind`                    |
+| Field key, numeric table    | `value`                                                      |
+| Field key, string table     | `value_str`                                                  |
+| Field keys, position table  | `lat`, `lon` (in that order)                                 |
+| `value_kind` values         | `boolean`, `identity`                                        |
+| Timestamp unit              | nanoseconds since the Unix epoch, decimal integer, no suffix |
+| Timestamp precision         | 1 µs (1000 ns) minimum step between assigned timestamps      |
+
+### Batching and buffering
+
+| Constant                 | Value               |
+| ------------------------ | ------------------- |
+| Flush interval           | 5000 ms             |
+| Flush line-count trigger | 1000 buffered lines |
+| Disconnected buffer cap  | 100000 lines        |
+| Drop policy on cap       | oldest lines first  |
+
+### Connection
+
+| Constant                 | Value               |
+| ------------------------ | ------------------- |
+| Initial reconnect delay  | 1000 ms             |
+| Reconnect backoff factor | 2                   |
+| Maximum reconnect delay  | 30000 ms            |
+| Stability window         | 5000 ms             |
+| Unhealthy flap threshold | 5 consecutive flaps |
+
+### Messages
+
+| Message               | Channel            | Exact text                                                                                                                      |
+| --------------------- | ------------------ | ------------------------------------------------------------------------------------------------------------------------------- |
+| Unhealthy, no drops   | plugin error line  | `QuestDB keeps dropping the write connection — the container may be unhealthy or out of memory.`                                |
+| Unhealthy, with drops | plugin error line  | `QuestDB keeps dropping the write connection — the container may be unhealthy or out of memory (<N> buffered samples dropped).` |
+| Recovered             | plugin status line | `Recording to QuestDB at <host>:<port>`                                                                                         |
+| Connected             | debug log          | `ILP connected to <host>:<port>`                                                                                                |
+| Socket error          | debug log          | `ILP socket error: <error message>`                                                                                             |
+| Flap                  | debug log          | `ILP connection dropped after <up>ms (flap #<k>), retrying in <delay>ms`                                                        |
+| Write failed          | debug log          | `ILP write failed, re-queued batch: <error message>`                                                                            |
+| Backpressure released | debug log          | `ILP socket drained, resuming writes`                                                                                           |
+
+The dash in the unhealthy message is U+2014 (em dash), surrounded by one space on each side. `<N>` is a decimal integer. `<up>`, `<k>` and `<delay>` are decimal integers.
+
+## Behaviour
+
+### Inputs and outputs
+
+1. The plugin hands this surface one sample at a time. A sample is one of three kinds: numeric (path, context, number), string (path, context, string, optional kind `boolean` or `identity`), or position (context, latitude, longitude). Every kind carries an optional source string. No sample carries a timestamp; the timestamp is assigned at hand-over (rule 15).
+2. Besides the byte stream, this surface has two observable outputs: debug log lines (Messages table) and the plugin's status card. Rule 31 sets the card's error line to the unhealthy message; rule 35 sets the card's status line to `Recording to QuestDB at <host>:<port>`.
+
+### Line shapes
+
+3. Numeric sample:
+   ```
+   signalk,path=<path>,context=<context>[,source=<source>] value=<number> <ts>\n
+   ```
+4. String sample:
+   ```
+   signalk_str,path=<path>,context=<context>[,source=<source>][,value_kind=<kind>] value_str="<string>" <ts>\n
+   ```
+5. Position sample:
+   ```
+   signalk_position,context=<context>[,source=<source>] lat=<number>,lon=<number> <ts>\n
+   ```
+6. Tags and fields are separated by exactly one space; the field set and the timestamp are separated by exactly one space. There is no whitespace anywhere else.
+7. `path` and `context` are always present in the `signalk` and `signalk_str` lines. `signalk_position` has no `path` tag.
+8. `source` is present only when the supplied source string is non-empty. An absent or empty source emits no `source` tag at all, so the column is null for that row.
+9. `value_kind` is present only when the string sample carries a kind. Plain text emits no `value_kind` tag. Numeric and position lines never carry `value_kind`.
+10. Numbers (`value`, `lat`, `lon`) are formatted with JavaScript's default number-to-string conversion: shortest round-trip decimal, no thousands separators, no `i` suffix. Examples: `6.4`, `1` for 1.0, `0.1`, `1e+21`, `1e-7`, `NaN`, `Infinity`, `-Infinity`. QuestDB receives every numeric field as a floating-point literal.
+11. Every tag value, including `path`, `context`, `source` and the kind, is escaped by prefixing a backslash to each of these characters: `,` `=` space newline `\`. Nothing else is altered. A kind of `boolean` or `identity` is unchanged by escaping.
+12. The string field value is wrapped in double quotes and escaped by prefixing a backslash to each `"` and `\`. Nothing else is altered; newlines are passed through unescaped.
+
+### Timestamps
+
+13. The timestamp is nanoseconds since the Unix epoch.
+14. The timestamp is assigned at the moment the sample is handed over, not at flush time.
+15. The assigned value is the wall clock in milliseconds × 1000000, subject to a monotonic floor: if that value is not greater than the last timestamp assigned since the plugin started, the assigned timestamp is the last timestamp + 1000 ns instead. Assigned timestamps therefore strictly increase across all three tables and across reconnections, and differ from each other by at least 1 µs, which keeps rows distinct at QuestDB's microsecond storage resolution. A timestamp taken from the wall clock ends in six zero digits; one raised by the floor does not.
+16. If the wall clock steps backwards, assigned timestamps continue from the floor in 1 µs steps until the wall clock passes it.
+
+### Batching
+
+17. Every line is appended to an in-memory buffer in the order the samples arrive. Lines are never reordered relative to each other.
+18. A flush concatenates every buffered line in order into one string, empties the buffer, and issues one socket write for the whole string. A flush while disconnected does nothing; the lines stay buffered.
+19. A flush happens: (a) every 5000 ms while connected, on a timer that starts when a connection succeeds and stops when it closes; (b) immediately when a line is appended and the buffer holds at least 1000 lines and the connection is up; (c) immediately after an automatic reconnection succeeds, when the buffer is non-empty; (d) on disconnect, when the connection is up and the buffer is non-empty. The first connection at plugin start does not flush on its own; the timer does, within 5000 ms.
+20. A single flush can carry more than 1000 lines, up to the buffer cap, for example after a reconnection.
+21. When the socket reports a write as failed (for example because the peer reset the connection while the write was still pending in the local send queue), every line of that batch is put back at the front of the buffer, in its original order and ahead of any line appended since, the buffer cap is applied, and the debug log receives `ILP write failed, re-queued batch: <error message>`. The batch is retried by the next flush. QuestDB orders rows by the designated timestamp, so the resulting out-of-order arrival is acceptable. When several writes are pending when the socket fails, each is handled this way in the order it was issued, so each later batch lands in front of the earlier ones: after reconnection the batches are sent in reverse order of issue, each batch internally in order, and the log line appears once per failed batch. Data that the local kernel had already accepted is not retained; if the peer discards it, it is lost and not counted in `<N>`.
+22. When the socket signals backpressure (its send buffer is full), the debug log receives `ILP socket drained, resuming writes` when the send buffer drains, once for every flush that was issued while the buffer was full; several identical lines therefore appear at the same moment when more than one flush was issued during the episode. Appending and flushing continue unthrottled in the meantime. When more than 10 flushes are issued during one episode, the Node.js process prints a `MaxListenersExceededWarning` for `drain` listeners on its stderr.
+
+### Buffer cap and drops
+
+23. After every append and after every re-queue, if the buffer holds more than 100000 lines, the excess is removed from the head (the oldest lines).
+24. `<N>` in the unhealthy message is the number of lines removed by rule 23 since the last unhealthy-to-healthy recovery (rule 35), or since plugin start when no recovery has happened yet. Lines removed before the unhealthy episode began are included. `<N>` returns to zero only on recovery.
+25. Lines that are still buffered when disconnect (rule 37) runs while the connection is down are discarded without being counted in `<N>`.
+
+### Connect
+
+26. One TCP connection is opened to the configured host and port.
+27. When the TCP connection succeeds: the debug log receives `ILP connected to <host>:<port>`, and the stability window (rule 34) and the flush timer start. The reconnect delay is not reset at this point.
+28. When the connection attempt fails: the debug log receives `ILP socket error: <error message>`. A failed first attempt at plugin start puts `Startup failed: <error message>` on the plugin's error line (lifecycle surface). The close handling of rule 30 still runs afterwards, so the failed attempt also schedules a reconnection.
+29. An error on an established connection is logged the same way; the connection then closes and rule 30 applies.
+
+### Close, flap counting, and reconnect backoff
+
+30. Every close of the socket, whether after a failed attempt, a peer drop, or a local error, marks the connection down and stops the stability window and the flush timer. Unless disconnect has been requested, rules 31 to 33 then apply.
+31. If the connection had not reached the end of its stability window (including an attempt that never connected), the close is a flap: the consecutive flap count increases by one; the reconnect delay becomes `min(2 × current delay, 30000)` ms; the debug log receives `ILP connection dropped after <up>ms (flap #<k>), retrying in <delay>ms`, where `<up>` is the milliseconds the connection was up (0 when it never connected), `<k>` is the new flap count, and `<delay>` is the new delay. If the flap count is at least 5, the plugin's error line is set to the unhealthy message (rule 36); the connection is then in the unhealthy state. The error line is set again on every further flap while the count stays at or above 5, each time with the current `<N>`.
+32. If the connection had reached the end of its stability window, the close is not a flap: neither the flap count nor the delay changes, and the card does not change.
+33. One reconnection attempt is made after the current reconnect delay; on success the buffer is flushed if non-empty; on failure rule 30 applies again. Because the delay doubles on the first flap before it is used, the wait sequence after a cold failure is 2000, 4000, 8000, 16000, 30000, 30000, … ms. When every attempt fails immediately, the fifth flap, and with it the first setting of the error line, occurs 30000 ms (2000 + 4000 + 8000 + 16000) after the first failure, plus the time each attempt takes to fail; every later flap follows 30000 ms after the previous one.
+
+### Stability and health
+
+34. The stability window ends 5000 ms after a connection succeeds if that same connection is still up and disconnect has not been requested. At that moment the reconnect delay is reset to 1000 ms, the flap count is reset to zero, and rule 35 applies.
+35. If the connection is in the unhealthy state (rule 31), the end of the stability window ends that state, resets `<N>` (rule 24) to zero, and sets the plugin's status line to `Recording to QuestDB at <host>:<port>`. The status line is set only on this unhealthy-to-healthy transition; a connection that becomes stable without an unhealthy episode leaves the card unchanged. Recovery does not depend on any later close: a connection that simply stays up is enough.
+36. The unhealthy message is `QuestDB keeps dropping the write connection — the container may be unhealthy or out of memory` followed by ` (<N> buffered samples dropped)` when `<N>` is greater than zero, then `.`.
+
+### Disconnect and final flush
+
+37. On disconnect no further reconnection is attempted and a pending one is cancelled; the flush timer and the stability window stop. If the connection is up and the buffer is non-empty, one final write is issued with the whole buffer. The socket is then half-closed: the FIN follows the final write on the wire. Disconnect completes once the FIN has been written. If no socket was ever opened, or the socket is already closed (after a failed attempt or a drop) with a reconnection pending, disconnect cancels the pending reconnection and completes at once. A socket close that arrives after disconnect neither counts as a flap nor schedules a reconnection.
+38. The final write of rule 37 is not waited for. If it fails, its lines are re-queued into the buffer, which is then discarded, so those lines are lost without being counted in `<N>`.
+
+## Cross-surface references
+
+- Table names `signalk`, `signalk_str`, `signalk_position`, and the columns `path`, `context`, `source`, `value_kind`, `value`, `value_str`, `lat`, `lon` must match the storage surface. The ILP timestamp lands in the designated timestamp column (`ts`).
+- `value_kind` values `boolean` and `identity` are chosen by the ingestion surface; `identity` marks vessel-name rows written with path `name`. The history v1 and history v2 surfaces read them back.
+- The `context` tag is emitted exactly as supplied; context normalisation (for example `self`) is the ingestion surface's responsibility.
+- Timestamps are nanoseconds on the wire and microseconds in storage; the assigned-timestamp floor guarantees distinct `ts` values for same-millisecond writes, which the deduplication keys of the tables depend on.
+- The unhealthy message goes on the plugin's error line; recovery sets the status line `Recording to QuestDB at <host>:<port>`, the same text the lifecycle surface sets when start completes.
+- A failed first connection surfaces through the lifecycle surface as `Startup failed: <error message>`.
+- After the disconnected buffer discards lines (rule 23), the ingestion surface writes the next identity report for each context again even if the name is unchanged.
+- Host and ILP port come from the configuration surface (default `127.0.0.1`, `9009`); the flush interval is not configurable.
+- The fifth flap after a cold failure occurs 30000 ms after the first failure (rule 33); the lifecycle surface states the same figure.
+
+## Observed defects
+
+- A newline inside a path, context, source or kind is escaped as a backslash followed by a literal newline, which ends the ILP line at that point; the remainder is sent as a separate malformed line.
+- A newline inside a string field value is sent unescaped, which likewise splits the line.
+- The first retry after a cold connection failure waits 2000 ms, not the stated initial delay of 1000 ms, because the delay doubles before its first use.
+- After a failed first connection the connection keeps reconnecting in the background until disconnect is called, so the debug log shows retry lines after the card shows `Startup failed: <error message>`.
+- Once the flap count reaches 5, the plugin's error line is set again on every further flap, so the plugin error is re-set every backoff period.
+- Lines buffered while disconnected are discarded silently on disconnect and are not counted in `<N>`.
+- The final write on disconnect is not waited for; when it fails, its lines are lost without being counted in `<N>`.
+- When several batches are pending on the socket when it fails, they are re-queued in reverse order of issue, so the second connection receives the newest batch first.
+- Data already accepted by the local kernel when the peer resets the connection is lost without being counted in `<N>`.
+- More than 10 flushes during one backpressure episode make the process print a `MaxListenersExceededWarning` on stderr, and the drain line is logged once per flush on the same drain.
+
+## Test cases
+
+Rows that wait on the flush interval, the reconnect delays or the stability window state the outcome at the production constants.
+
+| Input / state                                                                                                                           | Action                                                                                                                                                                                                                                    | Expected outcome                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
+| --------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Connected                                                                                                                               | Numeric sample path `navigation.speedOverGround`, context `self`, value 6.4; wait for the next flush                                                                                                                                      | Socket receives text containing `signalk,path=navigation.speedOverGround,context=self value=6.4`; the received text ends with `\n`                                                                                                                                                                                                                                                                                                                                                                                                                                     |
+| Connected                                                                                                                               | String sample path `navigation.state`, context `self`, value `motoring`, no kind; wait for the next flush                                                                                                                                 | Socket receives `signalk_str,path=navigation.state,context=self value_str="motoring"`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
+| Connected                                                                                                                               | String sample `switches.bilge.state` / `self` / `true` with kind `boolean`; then `some.text.path` / `self` / `true` with no kind; wait for the next flush                                                                                 | Socket receives `signalk_str,path=switches.bilge.state,context=self,value_kind=boolean value_str="true"` and `signalk_str,path=some.text.path,context=self value_str="true"`                                                                                                                                                                                                                                                                                                                                                                                           |
+| Connected                                                                                                                               | Numeric sample with source `gps.main`; string sample kind `boolean` with source `n2k-on-ve.can0.115`; position 60.1/24.9 with source `gps.main`; numeric sample `environment.depth.belowKeel` 3.2 without source; wait for the next flush | Socket receives `signalk,path=navigation.speedOverGround,context=self,source=gps.main value=6.4`; `signalk_str,path=navigation.state,context=self,source=n2k-on-ve.can0.115,value_kind=boolean value_str="true"`; `signalk_position,context=self,source=gps.main lat=60.1,lon=24.9`; and `signalk,path=environment.depth.belowKeel,context=self value=3.2` with no `source` tag                                                                                                                                                                                        |
+| Connected                                                                                                                               | Position sample context `self`, latitude 52.5, longitude 13.4; wait for the next flush                                                                                                                                                    | Socket receives `signalk_position,context=self lat=52.5,lon=13.4`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
+| Connected                                                                                                                               | Numeric sample path `path with spaces`, context `ctx,with,commas`; wait for the next flush                                                                                                                                                | Socket receives `path\ with\ spaces` and `ctx\,with\,commas`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
+| Connected                                                                                                                               | Numeric sample; observe the socket 700 ms later                                                                                                                                                                                           | Socket has received nothing                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
+| Connected                                                                                                                               | Numeric sample; observe the socket 5000 ms after the connection was established                                                                                                                                                           | Socket has received text containing `navigation.speedOverGround`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
+| Connected                                                                                                                               | 1000 numeric samples in one synchronous burst                                                                                                                                                                                             | One write carrying all 1000 lines arrives at once, without waiting for the flush timer                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
+| Connected                                                                                                                               | Five numeric samples to the same path in one synchronous burst; wait for the next flush                                                                                                                                                   | Five lines received; each trailing timestamp is strictly greater than the previous one and differs from it by at least 1000 ns (distinct after integer division by 1000)                                                                                                                                                                                                                                                                                                                                                                                               |
+| Peer accepts the first connection and closes it 50 ms later, before any flush; holds the second connection open                         | One numeric sample; wait past the first reconnect delay; disconnect                                                                                                                                                                       | The debug log shows `ILP connection dropped after <up>ms (flap #1), retrying in 2000ms`; the second connection is opened 2000 ms after the drop and receives `signalk,path=navigation.speedOverGround,context=self value=6.4` immediately on reconnection, without waiting for a flush interval                                                                                                                                                                                                                                                                        |
+| Peer accepts the first connection, never reads from it, and resets it 300 ms after it was established; holds the second connection open | 50000 numeric samples with values 0 to 49999 in one synchronous burst (one immediate flush per 1000 lines, enough to fill the local send buffer); wait past the first reconnect delay; disconnect                                         | For every batch still pending in the local send queue when the reset lands, the debug log shows one `ILP write failed, re-queued batch: <error message>` line; these are followed by `ILP socket error: <error message>` and `ILP connection dropped after <up>ms (flap #1), retrying in 2000ms`. Immediately on reconnection the second connection receives exactly those pending batches, each batch in its original internal order, the batches in reverse order of issue (highest values first). Batches the local kernel had accepted before the reset are absent |
+| Peer accepts and immediately closes every connection                                                                                    | Connect; wait until the fifth flap; disconnect                                                                                                                                                                                            | The debug log shows `(flap #1), retrying in 2000ms`, `(flap #2), retrying in 4000ms`, `(flap #3), retrying in 8000ms`, `(flap #4), retrying in 16000ms`, `(flap #5), retrying in 30000ms`; at the fifth flap, 30000 ms after the first drop, the plugin's error line is set to a message containing `dropping the write connection`; it is set again every 30000 ms while the drops continue                                                                                                                                                                           |
+| Peer closes the first five connections immediately, then holds every later connection open                                              | Connect; wait until the sixth connection has been up for 5000 ms; disconnect                                                                                                                                                              | The plugin's error line is set at the fifth flap (30000 ms after the first drop); the sixth attempt, 30000 ms later, succeeds; 5000 ms after that the plugin's status line is set to `Recording to QuestDB at <host>:<port>` without any further close having happened                                                                                                                                                                                                                                                                                                 |
+| Peer refuses every connection                                                                                                           | Hand over 100002 numeric samples in one burst; wait until the fifth flap                                                                                                                                                                  | The plugin's error line is exactly `QuestDB keeps dropping the write connection — the container may be unhealthy or out of memory (2 buffered samples dropped).`                                                                                                                                                                                                                                                                                                                                                                                                       |
+| Peer refuses every connection                                                                                                           | Hand over 100002 numeric samples in one burst; then the peer starts accepting and holds the connection open                                                                                                                               | On the next reconnection exactly 100000 lines arrive in one write: the 100000 most recent samples in order; the two oldest are absent                                                                                                                                                                                                                                                                                                                                                                                                                                  |
