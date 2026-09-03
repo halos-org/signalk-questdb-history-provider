@@ -7,8 +7,8 @@ import {
 } from "./lifecycle.js";
 import { PLUGIN_ID } from "./plugin-id.js";
 
-/** Chosen after this rewrite; the same value goes into package.json and the README. */
-export const DISPLAY_NAME = "DISPLAY_NAME";
+/** The same value is in `signalk.displayName` in package.json and in the README. */
+export const DISPLAY_NAME = "QuestDB History Provider";
 
 export interface HistoryPlugin extends Plugin {
   start(config: object): void;

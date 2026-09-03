@@ -2,13 +2,13 @@
   "name": "signalk-questdb-history-provider",
   "version": "2.0.1",
   "type": "module",
-  "description": "",
+  "description": "An open source history provider for Signal K backed by QuestDB: records deltas and answers history queries.",
   "keywords": [
     "signalk-node-server-plugin",
     "signalk-category-database"
   ],
   "signalk": {
-    "displayName": "DISPLAY_NAME",
+    "displayName": "QuestDB History Provider",
     "appIcon": "app-icon.svg"
   },
   "main": "dist/index.js",

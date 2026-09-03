@@ -32,7 +32,7 @@ A Signal K server plugin that records deltas into QuestDB over ILP and serves th
 | `src/history/v2.ts`            | `registerHistoryApiProvider` provider                                                 |
 | `src/history/v1.ts`            | `registerHistoryProvider` playback provider                                           |
 
-`DISPLAY_NAME` is a placeholder in two places: `signalk.displayName` in `package.json` and the `DISPLAY_NAME` constant in `src/index.ts`. The README search instruction carries the same value. Change all three together.
+The display name lives in three places: `signalk.displayName` in `package.json`, the `DISPLAY_NAME` constant in `src/index.ts`, and the README's search and navigation instructions. Change all three together.
 
 ## Conventions
 

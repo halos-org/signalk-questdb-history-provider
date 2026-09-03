@@ -14,7 +14,7 @@ It records the vessel data Signal K carries -- numbers, strings, booleans, posit
 
 The plugin is on npm as `signalk-questdb-history-provider` and carries the `signalk-node-server-plugin` keyword, so it appears in the server's own App Store:
 
-In the admin UI, open **Apps & Plugins -> Store**, search for _QuestDB History_, install it, and restart the server when prompted. (Servers older than 2.27 call the same two pages **Appstore** and **Server -> Plugin Config**.)
+In the admin UI, open **Apps & Plugins -> Store**, search for _QuestDB History Provider_, install it, and restart the server when prompted. (Servers older than 2.27 call the same two pages **Appstore** and **Server -> Plugin Config**.)
 
 Or install it into the Signal K data directory yourself:
 
@@ -35,7 +35,7 @@ Everywhere else, decide `cairo.commit.mode` before you record anything -- it set
 
 ## Pointing the plugin at QuestDB
 
-In **Apps & Plugins -> Configuration -> QuestDB History**, enable the plugin and set **QuestDB host** plus the HTTP and ILP ports to wherever your QuestDB listens. The defaults (`127.0.0.1`, `9000`, `9009`) are QuestDB's own, and are right when both run on the same host.
+In **Apps & Plugins -> Configuration -> QuestDB History Provider**, enable the plugin and set **QuestDB host** plus the HTTP and ILP ports to wherever your QuestDB listens. The defaults (`127.0.0.1`, `9000`, `9009`) are QuestDB's own, and are right when both run on the same host.
 
 The plugin makes ordinary outbound connections to those ports. It publishes nothing and opens no ports of its own.
 
