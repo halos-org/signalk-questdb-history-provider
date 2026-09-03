@@ -453,6 +453,13 @@ Path specifications here use `context: "self"`.
 | Two specs for the same path: `sourceRef: "gps.main"` (rows `[ts, 1.1]`) and `sourceRef: "gps.backup"` (rows `[ts, 2.2]`), same `ts`           | `getValues` | `data` is `[[ts, 1.1, 2.2]]`                                                       |
 | `sourceRef: "x'; DROP TABLE signalk"`                                                                                                         | `getValues` | Rejects                                                                            |
 
+### Aggregate names
+
+| Input / state                                                                                                 | Action      | Expected outcome                                                                        |
+| ------------------------------------------------------------------------------------------------------------- | ----------- | --------------------------------------------------------------------------------------- |
+| One numeric path, `aggregate` `constructor` (a name every object inherits), `resolution` 60, one row returned | `getValues` | SQL contains `avg(value)` and no function text; the unlisted name is treated as unknown |
+| One numeric path, `aggregate` `bogus`, `resolution` 60, one row returned                                      | `getValues` | SQL contains `avg(value)`; `values[0].method` is `bogus`                                |
+
 ### Client-side aggregate parameters
 
 The raw read returns six rows one second apart (`2024-01-01T00:00:01.000000Z` to `...:06...`) with values `[0, 10, 20, 30, 40, 50]`; `context: "self"`. "Column" means the second element of each `data` row, in order.
