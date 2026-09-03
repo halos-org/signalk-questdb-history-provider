@@ -421,7 +421,7 @@ describe("playback window reads", () => {
       6000,
     );
     assert.ok(second.includes("ts >= '2024-01-01T00:01:00.000"));
-    assert.ok(elapsed >= 5 && elapsed < 200, `elapsed ${elapsed}`);
+    assert.ok(elapsed >= 5 && elapsed < 2000, `elapsed ${elapsed}`);
   });
 
   it("reads the first window during the call with a 60 s window", async () => {

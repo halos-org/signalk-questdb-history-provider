@@ -104,6 +104,7 @@ export interface FakeIlpPeer {
 /** A TCP listener standing in for QuestDB's ILP port. */
 export async function startFakeIlpPeer(
   onConnection: (socket: net.Socket, index: number) => void = () => undefined,
+  port = 0,
 ): Promise<FakeIlpPeer> {
   const peer: FakeIlpPeer = {
     host: "127.0.0.1",
@@ -127,7 +128,7 @@ export async function startFakeIlpPeer(
     socket.on("error", () => undefined);
     peer.onConnection(socket, index);
   });
-  server.listen(0, peer.host);
+  server.listen(port, peer.host);
   await once(server, "listening");
   peer.port = (server.address() as net.AddressInfo).port;
   return peer;

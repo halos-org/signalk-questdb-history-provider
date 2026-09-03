@@ -528,9 +528,7 @@ describe("connection", () => {
     await waitFor(() => h.log.some((l) => l.includes(flapLine(1, 2000))));
     const late = await startFakeIlpPeer();
     await late.close();
-    const peer = await new Promise<FakeIlpPeer>((resolve) => {
-      startFakeIlpPeerOn(port).then(resolve);
-    });
+    const peer = await startFakeIlpPeer(undefined, port);
     peers.push(peer);
     mock.timers.tick(2000);
     await waitFor(() => peer.sockets.length === 1);
@@ -569,26 +567,3 @@ describe("connection", () => {
     );
   });
 });
-
-async function startFakeIlpPeerOn(port: number): Promise<FakeIlpPeer> {
-  const peer = await startFakeIlpPeer();
-  await peer.close();
-  const bound: FakeIlpPeer = { ...peer, port, sockets: [], received: [] };
-  const server = net.createServer((socket) => {
-    const index = bound.sockets.length;
-    bound.sockets.push(socket);
-    bound.received.push("");
-    socket.on("data", (chunk) => {
-      bound.received[index] += chunk.toString("utf8");
-    });
-    socket.on("error", () => undefined);
-  });
-  bound.close = async () => {
-    for (const socket of bound.sockets) socket.destroy();
-    server.close();
-    await new Promise((resolve) => server.once("close", resolve));
-  };
-  server.listen(port, bound.host);
-  await new Promise((resolve) => server.once("listening", resolve));
-  return bound;
-}

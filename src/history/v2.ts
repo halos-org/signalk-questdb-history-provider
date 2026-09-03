@@ -155,7 +155,9 @@ export function createHistoryApiProvider(
     period: number,
     entry: ValueEntry,
   ): Promise<Column> {
-    const aggregate = SQL_AGGREGATES[spec.aggregate] ?? SQL_AGGREGATES.average;
+    const aggregate = Object.hasOwn(SQL_AGGREGATES, spec.aggregate)
+      ? SQL_AGGREGATES[spec.aggregate]
+      : SQL_AGGREGATES.average;
     const numericSql =
       period > 0
         ? `SELECT ts, ${aggregate} as agg_value FROM signalk WHERE ${where} SAMPLE BY ${period}s FILL(NULL) ORDER BY ts`

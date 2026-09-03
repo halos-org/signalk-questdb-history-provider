@@ -970,3 +970,17 @@ describe("README invariant", () => {
     );
   });
 });
+
+describe("aggregate names", () => {
+  it("treats an inherited object property name as unknown", async () => {
+    const f = fixture(() => [["2024-01-01T00:00:00.000000Z", 1]]);
+    await f.provider.getValues(
+      request({
+        resolution: 60,
+        pathSpecs: [spec({ aggregate: "constructor" })],
+      }),
+    );
+    assert.ok(f.sqls[0].includes("avg(value)"), f.sqls[0]);
+    assert.ok(!f.sqls[0].includes("function"), f.sqls[0]);
+  });
+});
