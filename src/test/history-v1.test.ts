@@ -2,7 +2,7 @@
 // snapshot, playback window reads, vessel-name injection, and process
 // lifetime, against a scripted query function.
 
-import { describe, it } from "node:test";
+import { describe, it, mock } from "node:test";
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
 import path from "node:path";
@@ -14,6 +14,10 @@ import {
   type PlaybackSocket,
 } from "../history/v1.js";
 import { waitFor } from "./helpers.js";
+
+const realSetImmediate = setImmediate;
+const settle = (): Promise<void> =>
+  new Promise((resolve) => realSetImmediate(() => resolve()));
 
 const SELF = "vessels.urn:mrn:imo:mmsi:123456789";
 const OTHER = "vessels.urn:mrn:imo:mmsi:244813000";
@@ -416,12 +420,42 @@ describe("playback window reads", () => {
   });
 
   it("paces the next window by the playback rate", async () => {
-    const { second, elapsed } = await secondRead(
-      [row("2024-01-01T00:00:05.000000Z", "a.b", "self", null, "1", "number")],
-      6000,
-    );
-    assert.ok(second.includes("ts >= '2024-01-01T00:01:00.000"));
-    assert.ok(elapsed >= 5 && elapsed < 2000, `elapsed ${elapsed}`);
+    mock.timers.enable({ apis: ["setTimeout"] });
+    try {
+      const f = fixture((sql, index) => {
+        if (isNames(sql)) return [];
+        if (index === 0) {
+          return [
+            row(
+              "2024-01-01T00:00:05.000000Z",
+              "a.b",
+              "self",
+              null,
+              "1",
+              "number",
+            ),
+          ];
+        }
+        return [];
+      });
+      const stop = f.provider.streamHistory(
+        fakeSocket(),
+        { startTime: START, playbackRate: 6000 },
+        () => undefined,
+      );
+      await waitFor(() => f.sqls.filter(isWindow).length >= 1);
+      await settle();
+      mock.timers.tick(9);
+      await settle();
+      assert.equal(f.sqls.filter(isWindow).length, 1);
+      mock.timers.tick(1);
+      await waitFor(() => f.sqls.filter(isWindow).length >= 2);
+      stop();
+      const second = f.sqls.filter(isWindow)[1];
+      assert.ok(second.includes("ts >= '2024-01-01T00:01:00.000"));
+    } finally {
+      mock.timers.reset();
+    }
   });
 
   it("reads the first window during the call with a 60 s window", async () => {

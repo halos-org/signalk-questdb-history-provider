@@ -526,8 +526,6 @@ describe("connection", () => {
     const { h, port } = await refused();
     for (let i = 0; i < 100002; i++) h.send({ ...SOG, value: i });
     await waitFor(() => h.log.some((l) => l.includes(flapLine(1, 2000))));
-    const late = await startFakeIlpPeer();
-    await late.close();
     const peer = await startFakeIlpPeer(undefined, port);
     peers.push(peer);
     mock.timers.tick(2000);
