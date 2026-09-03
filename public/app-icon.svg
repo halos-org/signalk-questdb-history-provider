@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="Time-series history in QuestDB">
+  <rect width="64" height="64" rx="12" fill="#0e3a53"/>
+  <g fill="none" stroke="#9fd8e6" stroke-width="2.5" stroke-linecap="round">
+    <ellipse cx="32" cy="15" rx="16" ry="5.5"/>
+    <path d="M16 15v18c0 3 7.2 5.5 16 5.5s16-2.5 16-5.5V15"/>
+    <path d="M16 24c0 3 7.2 5.5 16 5.5s16-2.5 16-5.5" opacity="0.6"/>
+  </g>
+  <polyline points="8,56 16,49 22,53 30,43 38,48 46,40 56,45" fill="none" stroke="#ffcf5c" stroke-width="3" stroke-linejoin="round" stroke-linecap="round"/>
+</svg>
