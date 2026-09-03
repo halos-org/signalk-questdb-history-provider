@@ -1,0 +1,53 @@
+language: "en-US"
+
+reviews:
+  profile: "chill"
+  request_changes_workflow: false
+  high_level_summary: true
+  poem: false
+  review_status: true
+  auto_review:
+    enabled: true
+    drafts: false
+  path_instructions:
+    - path: "docs/spec/**"
+      instructions: >-
+        These files are the behavioural specification and the reference for
+        the code. A change here is a behaviour change: check that the matching
+        test-case table row and the code under src/ change with it. Every
+        constant listed (plugin id, config keys and titles, table DDL, ILP line
+        shapes, status and log strings, timing values) is fixed; flag any
+        drift between the spec text and the code.
+    - path: "src/**/*.ts"
+      instructions: >-
+        Compare the change against docs/spec/. The code deliberately reproduces
+        the behaviours listed under each spec file's "Observed defects"
+        heading; do not ask for those to be fixed in an unrelated change, but
+        do flag a change that fixes one without editing the spec file and its
+        test rows. Every relative import must carry a .js suffix (ESM with
+        nodenext resolution). No top-level await: the server loads the package
+        with require. No `any`. The plugin must reach the server only through
+        the app object it is given: flag any HTTP call to the server's own
+        API, and any reference to /signalk/v2 or _providers/_default.
+    - path: "src/test/**/*.ts"
+      instructions: >-
+        Tests run against dist/, so imports point at ../<module>.js. Each spec
+        test-case table row has a test; check that a removed or weakened
+        assertion still covers its row. The ILP suite uses node:test mock
+        timers with real sockets; a change that adds a real timer wait there
+        is a defect. Prefer the fakes in helpers.ts over new ad-hoc doubles.
+    - path: "README.md"
+      instructions: >-
+        Operator documentation. src/test/readme-config-table.test.ts pins the
+        configuration table to the schema defaults and titles; a schema change
+        needs a matching row change. The spec files list known disagreements
+        between this file and the code under "Disagreements with the README".
+    - path: "package.json"
+      instructions: >-
+        The keywords must contain signalk-node-server-plugin and must not
+        contain signalk-plugin-configurator or signalk-embeddable-webapp.
+        signalk.appIcon is a bare filename served from public/. The version
+        must match VERSION. Do not add a UI framework or a bundler.
+
+chat:
+  auto_reply: true
