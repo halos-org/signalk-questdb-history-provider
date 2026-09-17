@@ -45,7 +45,7 @@ function format {
 function ci {
   #@ Everything CI runs, in CI's order
   #@ Category: Testing
-  if [ -f package-lock.json ]; then npm ci; else npm install; fi
+  npm ci
   npm run ci-lint
   npm run build:all
 }
