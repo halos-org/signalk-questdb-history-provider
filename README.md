@@ -147,6 +147,8 @@ Without a sourceRef a path returns all sources mixed, as before.
 
 Registered via `app.registerHistoryProvider()`. Supports playback at configurable speed multipliers using chunked reads from QuestDB. Replayed updates carry the recorded sourceRef as `$source`, one update per source, so consumers see the same attribution the live stream had.
 
+An object value replays as one object per delta at its own path, `navigation.attitude` with `{ roll, pitch, yaw }`, as the live stream carried it. The snapshot a playback starts from holds each object's newest value of every field, so its fields can come from different deltas; it carries the time and source of the newest one.
+
 ### Grafana
 
 Connect Grafana to QuestDB through its PostgreSQL data source, pointed at QuestDB's PGWire port (8812 by default) with database `qdb`. `admin`/`quest` is QuestDB's default PGWire account, and it is not read-only. Configuring a read-only user and replacing that password is QuestDB administration -- its [PGWire settings](https://questdb.com/docs/configuration/postgres-wire-protocol) cover both -- and it wants doing before the port is reachable from anywhere you do not control.
