@@ -26,6 +26,7 @@ interface Leaf {
   path: string;
   source: string;
   value: number | string;
+  kind?: string;
 }
 
 describe(
@@ -75,15 +76,15 @@ describe(
 
     /** Inserts leaves, then waits until QuestDB has applied them. */
     async function store(table: Table, leaves: Leaf[]): Promise<void> {
-      const column = table === "signalk" ? "value" : "value_str";
+      const columns = table === "signalk" ? "value" : "value_str, value_kind";
       const tuples = leaves.map(
         (l) =>
           `('${l.ts}', '${l.path}', '${CONTEXT}', '${l.source}', ${
             typeof l.value === "number" ? l.value : `'${l.value}'`
-          })`,
+          }${table === "signalk" ? "" : l.kind ? `, '${l.kind}'` : ", NULL"})`,
       );
       await sql.query(
-        `INSERT INTO ${table} (ts, path, context, source, ${column}) VALUES ${tuples.join(", ")}`,
+        `INSERT INTO ${table} (ts, path, context, source, ${columns}) VALUES ${tuples.join(", ")}`,
       );
       stored[table] += leaves.length;
       const deadline = Date.now() + VISIBLE_TIMEOUT_MS;
@@ -242,6 +243,29 @@ describe(
       assert.deepEqual((await read(h, ATTITUDE, "last")).data, [
         [bucket(h), { roll: 2 }],
       ]);
+    });
+
+    it("reads a boolean text path's first and last value per bucket", async () => {
+      const h = "07";
+      const state = (rest: string, value: string): Leaf => ({
+        ts: at(h, rest),
+        path: "navigation.state",
+        source: "a",
+        value,
+        kind: "boolean",
+      });
+      await store("signalk_str", [
+        state("01.000000", "false"),
+        state("02.000000", "true"),
+      ]);
+
+      for (const [aggregate, expected] of [
+        ["first", false],
+        ["last", true],
+      ] as const) {
+        const r = await read(h, "navigation.state", aggregate);
+        assert.deepEqual(r.data, [[bucket(h), expected]], aggregate);
+      }
     });
 
     it("reads a notification's text fields from one delta", async () => {
