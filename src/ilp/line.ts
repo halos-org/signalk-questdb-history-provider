@@ -72,3 +72,13 @@ export function encodeSample(sample: Sample, ts: bigint): string {
       return `signalk_position,${context}${sourceTag(sample.source)} lat=${sample.latitude},lon=${sample.longitude} ${ts}\n`;
   }
 }
+
+/** The lines of one delta. Every sample carries the same timestamp. */
+export function encodeDelta(
+  samples: readonly Sample[],
+  clock: IlpTimestamps,
+  nowMs?: number,
+): string[] {
+  const ts = clock.next(nowMs);
+  return samples.map((sample) => encodeSample(sample, ts));
+}

@@ -28,6 +28,7 @@ A Signal K server plugin that records deltas into QuestDB over ILP and serves th
 | `src/storage/sql-client.ts`    | `GET /exec` transport and the health probe                                            |
 | `src/storage/tables.ts`        | DDL, retention TTL, schema repair                                                     |
 | `src/storage/validate.ts`      | Identifier and timestamp validators                                                   |
+| `src/storage/pointer.ts`       | Pointer leaf names `P#/k`: building, splitting and unescaping them                    |
 | `src/history/time-range.ts`    | `from`, `to`, `duration` resolution with Temporal                                     |
 | `src/history/v2.ts`            | `registerHistoryApiProvider` provider                                                 |
 | `src/history/v1.ts`            | `registerHistoryProvider` playback provider                                           |

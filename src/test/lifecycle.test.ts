@@ -123,7 +123,10 @@ describe("start sequence", () => {
     assert.ok(
       statements[2].includes("CREATE TABLE IF NOT EXISTS signalk_position ("),
     );
-    assert.ok(statements[3].startsWith('SELECT "column" FROM table_columns'));
+    assert.deepEqual(
+      statements.slice(3, 6).map((q) => q.slice(0, 34)),
+      Array(3).fill('SELECT "column" FROM table_columns'),
+    );
     assert.deepEqual(statements.slice(6), [
       "ALTER TABLE signalk SET TTL 7 DAYS",
       "ALTER TABLE signalk_str SET TTL 7 DAYS",
@@ -253,6 +256,48 @@ describe("start sequence", () => {
     );
     assert.equal(w.app.listeners.length, 0);
     assert.equal(w.app.statuses.at(-1), recording(w));
+  });
+
+  it("writes the leaves of one delta with one timestamp", async () => {
+    const w = await world();
+    w.plugin.start(w.config);
+    await waitFor(() => w.app.statuses.includes(recording(w)));
+    w.app.emit({
+      path: "navigation.attitude",
+      value: { roll: 0.02, pitch: -0.01, yaw: 1.57 },
+      context: w.app.selfContext,
+    });
+    await w.plugin.stop();
+    await waitFor(() => (w.peer.received[0] ?? "").includes("#/yaw"));
+    const lines = w.peer.received[0].trim().split("\n");
+    assert.deepEqual(
+      lines.map((l) => l.slice(0, l.indexOf(","))),
+      ["signalk", "signalk", "signalk"],
+    );
+    assert.ok(lines[0].includes("path=navigation.attitude#/roll,"));
+    const stamps = new Set(lines.map((l) => l.slice(l.lastIndexOf(" ") + 1)));
+    assert.equal(stamps.size, 1);
+  });
+
+  it("stop during table creation skips the repair pass", async () => {
+    const w = await world();
+    let release: ((reply: ScriptedAnswer) => void) | null = null;
+    w.questdb.answer = (sql) => {
+      if (!sql.includes("CREATE TABLE IF NOT EXISTS signalk_position")) {
+        return emptyResult;
+      }
+      return new Promise<ScriptedAnswer>((resolve) => {
+        release = resolve;
+      });
+    };
+    w.plugin.start(w.config);
+    await waitFor(() => release !== null);
+    const stopped = w.plugin.stop();
+    release!(emptyResult);
+    await stopped;
+    await delay(100);
+    assert.ok(w.questdb.queries.every((q) => !q.includes("table_columns")));
+    assert.equal(w.app.v2Providers.length, 0);
   });
 
   it("stop during the readiness poll ends the start on the waiting line", async () => {

@@ -5,7 +5,12 @@
 import { describe, it, beforeEach, afterEach, mock } from "node:test";
 import assert from "node:assert/strict";
 import net from "node:net";
-import { IlpTimestamps, encodeSample, type Sample } from "../ilp/line.js";
+import {
+  IlpTimestamps,
+  encodeDelta,
+  encodeSample,
+  type Sample,
+} from "../ilp/line.js";
 import {
   BUFFER_CAP_LINES,
   FLUSH_INTERVAL_MS,
@@ -29,6 +34,12 @@ const SOG: Sample = {
   context: "self",
   value: 6.4,
 };
+const attitudeLeaf = (key: string): Sample => ({
+  kind: "numeric",
+  path: `navigation.attitude#/${key}`,
+  context: "self",
+  value: 0.1,
+});
 
 const UNHEALTHY =
   "QuestDB keeps dropping the write connection — the container may be unhealthy or out of memory";
@@ -203,6 +214,23 @@ describe("timestamps", () => {
     assert.equal(third, second + 1000n);
     assert.equal(clock.next(1700000000001), 1700000000001000000n);
   });
+
+  it("are shared by the samples of one delta", () => {
+    const clock = new IlpTimestamps();
+    const lines = encodeDelta(
+      [attitudeLeaf("roll"), attitudeLeaf("pitch"), attitudeLeaf("yaw")],
+      clock,
+      1700000000000,
+    );
+    assert.deepEqual(lines, [
+      "signalk,path=navigation.attitude#/roll,context=self value=0.1 1700000000000000000\n",
+      "signalk,path=navigation.attitude#/pitch,context=self value=0.1 1700000000000000000\n",
+      "signalk,path=navigation.attitude#/yaw,context=self value=0.1 1700000000000000000\n",
+    ]);
+    assert.deepEqual(encodeDelta([SOG], clock, 1700000000000), [
+      "signalk,path=navigation.speedOverGround,context=self value=6.4 1700000000000001000\n",
+    ]);
+  });
 });
 
 interface Harness {
@@ -213,6 +241,7 @@ interface Harness {
   statuses: string[];
   clock: IlpTimestamps;
   send(sample: Sample): void;
+  sendDelta(samples: Sample[]): void;
 }
 
 const realSetTimeout = setTimeout;
@@ -231,7 +260,9 @@ function harness(peer: FakeIlpPeer, port = peer.port): Harness {
       setError: (m) => h.errors.push(m),
       setStatus: (m) => h.statuses.push(m),
     }),
-    send: (sample) => h.connection.append(encodeSample(sample, h.clock.next())),
+    send: (sample) =>
+      h.connection.append([encodeSample(sample, h.clock.next())]),
+    sendDelta: (samples) => h.connection.append(encodeDelta(samples, h.clock)),
   };
   return h;
 }
@@ -377,6 +408,13 @@ describe("connection", () => {
     await waitFor(() => lineCount(h.peer.received[0]) === 1000);
   });
 
+  it("flushes a delta that crosses 1000 lines in one write", async () => {
+    const h = await connected();
+    for (let i = 0; i < 998; i++) h.send(SOG);
+    h.sendDelta(["roll", "pitch", "yaw"].map(attitudeLeaf));
+    await waitFor(() => lineCount(h.peer.received[0] ?? "") === 1001);
+  });
+
   it("assigns strictly increasing timestamps a microsecond apart", async () => {
     const h = await connected();
     for (let i = 0; i < 5; i++) h.send(SOG);
@@ -391,6 +429,25 @@ describe("connection", () => {
       assert.ok(stamps[i] - stamps[i - 1] >= 1000n);
       assert.notEqual(stamps[i] / 1000n, stamps[i - 1] / 1000n);
     }
+  });
+
+  it("gives the leaves of one delta one timestamp and the next delta a later one", async () => {
+    const h = await connected();
+    h.sendDelta([
+      attitudeLeaf("roll"),
+      attitudeLeaf("pitch"),
+      attitudeLeaf("yaw"),
+    ]);
+    h.sendDelta([SOG]);
+    mock.timers.tick(FLUSH_INTERVAL_MS);
+    await waitFor(() => lineCount(h.peer.received[0] ?? "") === 4);
+    const stamps = h.peer.received[0]
+      .trim()
+      .split("\n")
+      .map((line) => BigInt(line.slice(line.lastIndexOf(" ") + 1)));
+    assert.equal(stamps[1], stamps[0]);
+    assert.equal(stamps[2], stamps[0]);
+    assert.ok(stamps[3] - stamps[0] >= 1000n);
   });
 
   it("reconnects after 2000 ms and flushes at once", async () => {
@@ -535,6 +592,19 @@ describe("connection", () => {
     assert.equal(lines.length, 100000);
     assert.ok(lines[0].includes(" value=2 "));
     assert.ok(lines[99999].includes(" value=100001 "));
+  });
+
+  it("drops a whole delta from the head when the cap is passed", async () => {
+    const { h, port } = await refused();
+    h.sendDelta(["roll", "pitch", "yaw"].map(attitudeLeaf));
+    for (let i = 0; i < 99998; i++) h.send({ ...SOG, value: i });
+    await waitFor(() => h.log.some((l) => l.includes(flapLine(1, 2000))));
+    const peer = await startFakeIlpPeer(undefined, port);
+    peers.push(peer);
+    mock.timers.tick(2000);
+    await waitFor(() => peer.sockets.length === 1);
+    await waitFor(() => lineCount(peer.received[0]) === 99998, 20000);
+    assert.ok(!peer.received[0].includes("navigation.attitude"));
   });
 
   it("writes buffered lines before the socket closes on disconnect", async () => {
