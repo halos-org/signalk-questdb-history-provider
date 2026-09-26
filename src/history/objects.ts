@@ -255,7 +255,7 @@ export function createObjectReader(options: ObjectReaderOptions): ObjectReader {
 }
 
 /** A string literal with every `'` doubled. */
-function literal(value: string): string {
+export function literal(value: string): string {
   return `'${value.replace(/'/g, "''")}'`;
 }
 
