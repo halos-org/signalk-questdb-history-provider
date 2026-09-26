@@ -22,6 +22,8 @@ export const EMA_DEFAULT_ALPHA = 0.2;
 const POSITION_PATH = "navigation.position";
 const SELF_ALIASES = new Set(["self", "vessels.self"]);
 const CLIENT_SIDE_AGGREGATES = new Set(["sma", "ema", "middle_index"]);
+/** The aggregates that pick a recorded value rather than compute one. */
+const SELECTING_AGGREGATES = new Set(["first", "last", "middle_index"]);
 
 const SQL_AGGREGATES: Record<string, string> = {
   average: "avg(value)",
@@ -31,6 +33,13 @@ const SQL_AGGREGATES: Record<string, string> = {
   last: "last(value)",
   mid: "(min(value) + max(value)) / 2",
 };
+
+const AGGREGATE_NAMES = [
+  ...Object.keys(SQL_AGGREGATES),
+  "middle_index",
+  "sma",
+  "ema",
+];
 
 export interface HistoryApiProviderOptions {
   selfContext: string;
@@ -103,6 +112,11 @@ export function createHistoryApiProvider(
     const columns: Column[] = [];
     for (const { spec, stored } of columnSpecs) {
       validateIdentifier(spec.path);
+      if (!AGGREGATE_NAMES.includes(spec.aggregate)) {
+        throw new Error(
+          `Unknown aggregate ${spec.aggregate}: use average, min, max, first, last, mid, middle_index, sma or ema`,
+        );
+      }
       const entry: ValueEntry = { path: spec.path, method: spec.aggregate };
       let source = "";
       if (stored === undefined) {
@@ -127,15 +141,12 @@ export function createHistoryApiProvider(
         const client = CLIENT_SIDE_AGGREGATES.has(spec.aggregate);
         const scalar = client
           ? await clientSideColumn(pathWhere, spec)
-          : await numericColumn(pathWhere, spec, period, entry);
+          : await numericColumn(pathWhere, spec, period);
         column = scalar.column;
         if (scalar.empty) {
           objects ??= createObjectReader({ query, contextWhere });
           const read = await objectColumn(objects, spec, source, period);
-          if (read.size > 0) {
-            column = read;
-            entry.method = spec.aggregate;
-          }
+          if (read.size > 0) column = read;
         }
       }
       values.push(entry);
@@ -209,20 +220,29 @@ export function createHistoryApiProvider(
     spec: history.PathSpec,
     period: number,
   ): Promise<Column> {
-    const axis = spec.aggregate === "last" ? "last" : "first";
-    const sql =
-      period > 0
-        ? `SELECT ts, ${axis}(lat) as lat, ${axis}(lon) as lon FROM signalk_position WHERE ${where} SAMPLE BY ${period}s FILL(NULL) ORDER BY ts`
-        : `SELECT ts, lat, lon FROM signalk_position WHERE ${where} ORDER BY ts LIMIT ${RAW_ROW_LIMIT}`;
-    const rows = await query(sql);
-    const column: Column = new Map();
-    for (const [ts, lat, lon] of rows) {
-      column.set(
-        String(ts),
-        lat != null && lon != null ? { latitude: lat, longitude: lon } : null,
+    const { aggregate } = spec;
+    if (
+      aggregate === "sma" ||
+      aggregate === "ema" ||
+      (period > 0 && !SELECTING_AGGREGATES.has(aggregate))
+    ) {
+      throw new Error(
+        `Aggregate ${aggregate} does not apply to position path ${POSITION_PATH}: use first, last or middle_index`,
       );
     }
-    return column;
+    const sql =
+      aggregate === "middle_index"
+        ? `SELECT ts, lat, lon FROM signalk_position WHERE ${where} ORDER BY ts LIMIT ${CLIENT_AGGREGATE_ROW_LIMIT}`
+        : period > 0
+          ? `SELECT ts, ${aggregate}(lat) as lat, ${aggregate}(lon) as lon FROM signalk_position WHERE ${where} SAMPLE BY ${period}s FILL(NULL) ORDER BY ts`
+          : `SELECT ts, lat, lon FROM signalk_position WHERE ${where} ORDER BY ts LIMIT ${RAW_ROW_LIMIT}`;
+    const rows = await query(sql);
+    const fixes = rows.map(([ts, lat, lon]) => ({
+      ts: String(ts),
+      value:
+        lat != null && lon != null ? { latitude: lat, longitude: lon } : null,
+    }));
+    return keyedColumn(fixes, aggregate === "middle_index");
   }
 
   async function clientSideColumn(
@@ -233,10 +253,21 @@ export function createHistoryApiProvider(
       `SELECT ts, value FROM signalk WHERE ${where} ORDER BY ts LIMIT ${CLIENT_AGGREGATE_ROW_LIMIT}`,
     );
     if (rows.length === 0) {
+      if (!(await hasText(where))) return { column: new Map(), empty: true };
+      if (spec.aggregate !== "middle_index") throw textRefusal(spec);
       const text = await query(
-        `SELECT ts FROM signalk_str WHERE ${where} LIMIT 1`,
+        `SELECT ts, value_str, value_kind FROM signalk_str WHERE ${where} ORDER BY ts LIMIT ${CLIENT_AGGREGATE_ROW_LIMIT}`,
       );
-      return { column: new Map(), empty: text.length === 0 };
+      return {
+        column: keyedColumn(
+          text.map(([ts, value, kind]) => ({
+            ts: String(ts),
+            value: decodeText(value, kind),
+          })),
+          true,
+        ),
+        empty: false,
+      };
     }
     const series = rows.map(([ts, value]) => ({
       ts: String(ts),
@@ -256,9 +287,8 @@ export function createHistoryApiProvider(
     where: string,
     spec: history.PathSpec,
     period: number,
-    entry: ValueEntry,
   ): Promise<ScalarColumn> {
-    const aggregate = sqlAggregate(spec.aggregate);
+    const aggregate = SQL_AGGREGATES[spec.aggregate];
     const numericSql =
       period > 0
         ? `SELECT ts, ${aggregate} as agg_value FROM signalk WHERE ${where} SAMPLE BY ${period}s FILL(NULL) ORDER BY ts`
@@ -270,10 +300,14 @@ export function createHistoryApiProvider(
         empty: false,
       };
     }
-    if (period > 0) entry.method = "last";
+    if (period > 0 && !SELECTING_AGGREGATES.has(spec.aggregate)) {
+      if (await hasText(where)) throw textRefusal(spec);
+      return { column: new Map(), empty: true };
+    }
+    const pick = spec.aggregate;
     const stringSql =
       period > 0
-        ? `SELECT ts, last(value_str) as value_str, last(value_kind) as value_kind FROM signalk_str WHERE ${where} SAMPLE BY ${period}s FILL(NULL) ORDER BY ts`
+        ? `SELECT ts, ${pick}(value_str) as value_str, ${pick}(value_kind) as value_kind FROM signalk_str WHERE ${where} SAMPLE BY ${period}s FILL(NULL) ORDER BY ts`
         : `SELECT ts, value_str, value_kind FROM signalk_str WHERE ${where} ORDER BY ts LIMIT ${RAW_ROW_LIMIT}`;
     const stringRows = await query(stringSql);
     return {
@@ -285,6 +319,14 @@ export function createHistoryApiProvider(
       ),
       empty: !stringRows.some(([, text]) => text != null),
     };
+  }
+
+  /** Q17: whether the path has scalar text rows. */
+  async function hasText(where: string): Promise<boolean> {
+    const rows = await query(
+      `SELECT ts FROM signalk_str WHERE ${where} LIMIT 1`,
+    );
+    return rows.length > 0;
   }
 
   async function objectColumn(
@@ -361,7 +403,7 @@ function guardSampleBuckets(
   range: ResolvedRange,
 ): void {
   const isSampled = (s: history.PathSpec): boolean =>
-    s.path === POSITION_PATH || !CLIENT_SIDE_AGGREGATES.has(s.aggregate);
+    !CLIENT_SIDE_AGGREGATES.has(s.aggregate);
   const isFallbackCapable = (s: history.PathSpec): boolean =>
     s.path !== POSITION_PATH && !CLIENT_SIDE_AGGREGATES.has(s.aggregate);
   const sampledCount = specs.filter(isSampled).length;
@@ -393,10 +435,21 @@ function orderSources(sources: Set<string | null>): (string | null)[] {
   return sources.has(null) ? [...named, null] : named;
 }
 
-function sqlAggregate(aggregate: string): string {
-  return Object.hasOwn(SQL_AGGREGATES, aggregate)
-    ? SQL_AGGREGATES[aggregate]
-    : SQL_AGGREGATES.average;
+function textRefusal(spec: history.PathSpec): Error {
+  return new Error(
+    `Aggregate ${spec.aggregate} does not apply to text path ${spec.path}: use first, last or middle_index`,
+  );
+}
+
+/** A column of rows in read order; `middle` keeps only the middle one. */
+function keyedColumn(
+  rows: { ts: string; value: unknown }[],
+  middle: boolean,
+): Column {
+  const values = middle
+    ? middleIndex(rows.map((r) => r.value))
+    : rows.map((r) => r.value);
+  return new Map(rows.map((r, i) => [r.ts, values[i]]));
 }
 
 function smooth(
