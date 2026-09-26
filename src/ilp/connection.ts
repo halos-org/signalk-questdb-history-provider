@@ -22,12 +22,15 @@ export const recordingStatus = (host: string, port: number): string =>
   `Recording to QuestDB at ${host}:${port}`;
 
 /**
- * The single TCP connection that carries ILP lines to QuestDB. Lines are
- * buffered and written in batches; the connection reconnects with backoff
+ * The single TCP connection that carries ILP lines to QuestDB. The lines of
+ * one delta are buffered as one entry, so a flush or the buffer cap never
+ * splits a delta. The connection reconnects with backoff
  * and reports a persistently flapping peer on the plugin's status card.
  */
 export class IlpConnection {
-  private buffer: string[] = [];
+  /** One entry per hand-over: every line of one delta. */
+  private buffer: (readonly string[])[] = [];
+  private lineCount = 0;
   private socket: net.Socket | null = null;
   private attempt: Promise<void> | null = null;
   private connected = false;
@@ -49,10 +52,13 @@ export class IlpConnection {
     return this.open(false);
   }
 
-  append(line: string): void {
-    this.buffer.push(line);
+  /** Buffers the lines of one delta together. */
+  append(lines: readonly string[]): void {
+    if (lines.length === 0) return;
+    this.buffer.push(lines);
+    this.lineCount += lines.length;
     this.applyCap();
-    if (this.connected && this.buffer.length >= FLUSH_LINE_COUNT) {
+    if (this.connected && this.lineCount >= FLUSH_LINE_COUNT) {
       this.flush();
     }
   }
@@ -70,6 +76,7 @@ export class IlpConnection {
     const socket = this.socket;
     if (!this.connected || !socket) {
       this.buffer = [];
+      this.lineCount = 0;
       return;
     }
     if (this.buffer.length > 0) {
@@ -145,6 +152,7 @@ export class IlpConnection {
     this.stopTimers();
     if (this.disconnectRequested) {
       this.buffer = [];
+      this.lineCount = 0;
       return;
     }
     if (!this.stable) {
@@ -183,22 +191,31 @@ export class IlpConnection {
   }
 
   private applyCap(): void {
-    const excess = this.buffer.length - BUFFER_CAP_LINES;
-    if (excess > 0) {
-      this.buffer.splice(0, excess);
-      this.dropped += excess;
-      this.options.onDrop?.();
+    if (this.lineCount <= BUFFER_CAP_LINES) return;
+    let removed = 0;
+    let entries = 0;
+    for (const entry of this.buffer) {
+      if (this.lineCount - removed <= BUFFER_CAP_LINES) break;
+      removed += entry.length;
+      entries++;
     }
+    this.buffer.splice(0, entries);
+    this.lineCount -= removed;
+    this.dropped += removed;
+    this.options.onDrop?.();
   }
 
   private flush(): void {
     const socket = this.socket;
     if (!this.connected || !socket || this.buffer.length === 0) return;
     const batch = this.buffer;
+    const batchLines = this.lineCount;
     this.buffer = [];
-    const written = socket.write(batch.join(""), (error) => {
+    this.lineCount = 0;
+    const written = socket.write(batch.flat().join(""), (error) => {
       if (!error) return;
       this.buffer = batch.concat(this.buffer);
+      this.lineCount += batchLines;
       this.applyCap();
       this.options.log(`ILP write failed, re-queued batch: ${error.message}`);
     });

@@ -2,7 +2,7 @@
 
 QuestDB history provider for Signal K -- a drop-in replacement for signalk-to-influxdb and signalk-to-influxdb2.
 
-It records the vessel data Signal K carries -- numbers, strings, booleans, positions, and the scalar leaves of object values -- into QuestDB, and serves it back through both the modern v2 History API and the legacy v1 playback API. It connects to a QuestDB you run; running the database is not the plugin's job.
+It records the vessel data Signal K carries -- numbers, strings, booleans, positions, and the scalar fields of object values, one level deep -- into QuestDB, and serves it back through both the modern v2 History API and the legacy v1 playback API. It connects to a QuestDB you run; running the database is not the plugin's job.
 
 ## Requirements
 
@@ -95,6 +95,8 @@ With no default configured, the server uses whichever provider registered first.
 { "environment.wind.*": 200 }
 ```
 
+**Object values** such as `navigation.attitude` are filtered and sampled on their own path, as one unit: every field of a delta is stored, or none is. A pattern that names a field (`navigation.attitude.roll`), or a glob that matches only fields (`navigation.attitude.*`), no longer matches anything for that object; edit such entries to name the object path. Broad globs such as `navigation.*` keep working. Meta updates (units, descriptions) are not recorded.
+
 ## Reading the history
 
 ### v2 (REST -- `/signalk/v2/api/history/`)
@@ -116,6 +118,19 @@ Registered via `app.registerHistoryApiProvider()`. Supports all aggregate method
 
 Both are computed here rather than by QuestDB, over raw samples. `resolution` does not bucket them: those columns come back at storage density, up to 50000 points per path.
 
+**Object values** come back as objects. Ask for the object's own path, `paths=navigation.attitude:last`, and each bucket holds `{ "roll": ..., "pitch": ..., "yaw": ... }`; `/paths` lists `navigation.attitude` once. An aggregate applies to the object as a whole, so an object path only takes the methods that pick a recorded delta:
+
+- `first` and `last` take one whole delta, the earliest or latest to arrive in the bucket, so the fields belong together. A field with no value in that delta is left out; a bucket with no data at all is `null`.
+- `middle_index` returns the middle delta whole.
+- Without `resolution` each delta is one object, up to 10000 deltas per path. A request that names no method is read this way, and its `method` reads `average` because the server fills that name in.
+- With `resolution`, `average`, `min`, `max` and `mid` fail the request with `Aggregate average does not apply to object path navigation.attitude: use first, last or middle_index`, and so do `sma` and `ema` with or without it. The plugin cannot tell whether a field is an angle, a vector component or a coordinate, so averaging each field on its own would return a plausible wrong value.
+
+Two deltas recorded in the same millisecond get distinct timestamps, so they stay two deltas. When a path has plain values as well as object fields in the range, the plain values are returned.
+
+An object is read one field at a time, and each field costs about what a plain path of the same density costs. Over a year of dense data on a Raspberry Pi, a downsampled object query can take tens of seconds in total and a single field can approach the 30-second deadline this plugin sets on every statement, as a year of a plain path already can. Shorten the range or read fewer objects per request if a query times out.
+
+A query for a single field by its dotted name -- `navigation.attitude.roll`, or `notifications.mob.state` for a notification -- gets no data recorded since the upgrade. Rows from earlier versions stay under those names and are not served at the object path; newer ones are only reachable through the object path.
+
 ```http
 GET /signalk/v2/api/history/values?paths=navigation.speedOverGround&duration=PT1H&resolution=60
 ```
@@ -131,6 +146,8 @@ Without a sourceRef a path returns all sources mixed, as before.
 ### v1 (WebSocket playback)
 
 Registered via `app.registerHistoryProvider()`. Supports playback at configurable speed multipliers using chunked reads from QuestDB. Replayed updates carry the recorded sourceRef as `$source`, one update per source, so consumers see the same attribution the live stream had.
+
+An object value replays as one object per delta at its own path, `navigation.attitude` with `{ roll, pitch, yaw }`, as the live stream carried it. The snapshot a playback starts from holds each object's newest value of every field, so its fields can come from different deltas; it carries the time and source of the newest one.
 
 ### Grafana
 
@@ -164,6 +181,8 @@ The plugin creates and owns three tables, all with WAL mode, daily partitioning 
 | `signalk_position` | Positions      | `ts`, `context` (SYMBOL), `source` (SYMBOL), `lat` (DOUBLE), `lon` (DOUBLE)                                |
 
 `ts` is the **server receive time**, not the timestamp a source claims. Marine sources carry independent clocks, and storing their timestamps makes commits land out of order -- QuestDB then rewrites partition tails on every merge (observed as >3000x write amplification). Receive time keeps ingestion append-only; the millisecond difference is far below the sampling resolution, and a device with a broken clock gets more accurate history, not less.
+
+The fields of an object value are stored one row each under a pointer name, `<path>#/<field>` (for example `navigation.attitude#/roll`), with one `ts` shared by every field of the delta. A `/` or `~` in a field name is escaped as `~1` or `~0`. Earlier versions stored them as `navigation.attitude.roll`; those rows stay as they were, and new rows are no longer written under the dotted name, so a query for a dotted field stops growing. A `navigation.position` value whose latitude or longitude is missing, not a number, or not finite is not recorded at all.
 
 `source` is the delta's sourceRef -- which receiver produced the row. Two GPS units feeding the same server interleave in storage, and without the column a track drawn from history zigzags between them. Rows recorded before the column existed have `source` null; they replay unattributed and cannot be filtered.
 

@@ -3,7 +3,7 @@ import { effectiveConfig } from "./config/effective.js";
 import { createHistoryApiProvider } from "./history/v2.js";
 import { createPlaybackProvider, type PlaybackProvider } from "./history/v1.js";
 import { IlpConnection, recordingStatus } from "./ilp/connection.js";
-import { IlpTimestamps, encodeSample } from "./ilp/line.js";
+import { IlpTimestamps, encodeDelta } from "./ilp/line.js";
 import { PathFilter } from "./ingestion/path-filter.js";
 import { Recorder, type DeltaLike } from "./ingestion/recorder.js";
 import { SamplingGate, SamplingPolicy } from "./ingestion/sampling.js";
@@ -186,7 +186,7 @@ export class PluginRuntime {
       filter,
       sampling,
       gate,
-      emit: (sample) => ilp.append(encodeSample(sample, timestamps.next())),
+      emit: (samples) => ilp.append(encodeDelta(samples, timestamps)),
     });
     const handle = (delta: DeltaLike): void => recorder!.handle(delta);
     this.unsubscribe = this.app.streambundle.getBus().onValue(handle);

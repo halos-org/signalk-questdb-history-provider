@@ -1,7 +1,15 @@
 import type { Temporal } from "@js-temporal/polyfill";
 import type { history } from "@signalk/server-api";
+import { objectPathOf } from "../storage/pointer.js";
 import type { QueryRows } from "../storage/sql-client.js";
 import { validateIdentifier, validateTimestamp } from "../storage/validate.js";
+import {
+  createObjectReader,
+  decodeText,
+  deltaColumn,
+  type Column,
+  type ObjectReader,
+} from "./objects.js";
 import { resolveTimeRange, type ResolvedRange } from "./time-range.js";
 
 export const MAX_SAMPLE_BUCKETS = 1000000;
@@ -29,12 +37,19 @@ export interface HistoryApiProviderOptions {
   now?: () => Temporal.Instant;
 }
 
-type Column = Map<string, unknown>;
-
 interface ValueEntry {
   path: string;
   method: string;
   sourceRef?: string;
+}
+
+/**
+ * A scalar column. `empty` is true when neither the numeric read nor the text
+ * read or probe found a row of the path, so it may be read as an object.
+ */
+interface ScalarColumn {
+  column: Column;
+  empty: boolean;
 }
 
 export function createHistoryApiProvider(
@@ -61,6 +76,7 @@ export function createHistoryApiProvider(
     const resolution = request.resolution;
     const sampled = typeof resolution === "number" && resolution > 0;
     const period = sampled ? Math.max(1, Math.floor(resolution)) : 0;
+    let objects: ObjectReader | undefined;
 
     const values: ValueEntry[] = [];
     const columns: Column[] = [];
@@ -72,22 +88,25 @@ export function createHistoryApiProvider(
       if (sourceRef) entry.sourceRef = sourceRef;
       const source = sourceRef ? ` AND source = '${sourceRef}'` : "";
       const contextWhere = `${rangeWhere(range)} AND context = '${storedContext}'`;
+      const pathWhere = `${contextWhere} AND path = '${spec.path}'${source}`;
 
       let column: Column;
       if (spec.path === POSITION_PATH) {
         column = await positionColumn(`${contextWhere}${source}`, spec, period);
-      } else if (CLIENT_SIDE_AGGREGATES.has(spec.aggregate)) {
-        column = await clientSideColumn(
-          `${contextWhere} AND path = '${spec.path}'${source}`,
-          spec,
-        );
       } else {
-        column = await numericColumn(
-          `${contextWhere} AND path = '${spec.path}'${source}`,
-          spec,
-          period,
-          entry,
-        );
+        const client = CLIENT_SIDE_AGGREGATES.has(spec.aggregate);
+        const scalar = client
+          ? await clientSideColumn(pathWhere, spec)
+          : await numericColumn(pathWhere, spec, period, entry);
+        column = scalar.column;
+        if (scalar.empty) {
+          objects ??= createObjectReader({ query, contextWhere });
+          const read = await objectColumn(objects, spec, source, period);
+          if (read.size > 0) {
+            column = read;
+            entry.method = spec.aggregate;
+          }
+        }
       }
       values.push(entry);
       columns.push(column);
@@ -125,28 +144,28 @@ export function createHistoryApiProvider(
   async function clientSideColumn(
     where: string,
     spec: history.PathSpec,
-  ): Promise<Column> {
+  ): Promise<ScalarColumn> {
     const rows = await query(
       `SELECT ts, value FROM signalk WHERE ${where} ORDER BY ts LIMIT ${CLIENT_AGGREGATE_ROW_LIMIT}`,
     );
+    if (rows.length === 0) {
+      const text = await query(
+        `SELECT ts FROM signalk_str WHERE ${where} LIMIT 1`,
+      );
+      return { column: new Map(), empty: text.length === 0 };
+    }
     const series = rows.map(([ts, value]) => ({
       ts: String(ts),
       value: typeof value === "number" ? value : null,
     }));
-    const parameter = Number(spec.parameter?.[0]);
-    const computed =
-      spec.aggregate === "sma"
-        ? simpleMovingAverage(
-            series.map((r) => r.value),
-            parameter,
-          )
-        : spec.aggregate === "ema"
-          ? exponentialMovingAverage(
-              series.map((r) => r.value),
-              parameter,
-            )
-          : middleIndex(series.map((r) => r.value));
-    return new Map(series.map((r, i) => [r.ts, computed[i]]));
+    const computed = smooth(
+      spec,
+      series.map((r) => r.value),
+    );
+    return {
+      column: new Map(series.map((r, i) => [r.ts, computed[i]])),
+      empty: false,
+    };
   }
 
   async function numericColumn(
@@ -154,17 +173,18 @@ export function createHistoryApiProvider(
     spec: history.PathSpec,
     period: number,
     entry: ValueEntry,
-  ): Promise<Column> {
-    const aggregate = Object.hasOwn(SQL_AGGREGATES, spec.aggregate)
-      ? SQL_AGGREGATES[spec.aggregate]
-      : SQL_AGGREGATES.average;
+  ): Promise<ScalarColumn> {
+    const aggregate = sqlAggregate(spec.aggregate);
     const numericSql =
       period > 0
         ? `SELECT ts, ${aggregate} as agg_value FROM signalk WHERE ${where} SAMPLE BY ${period}s FILL(NULL) ORDER BY ts`
         : `SELECT ts, value FROM signalk WHERE ${where} ORDER BY ts LIMIT ${RAW_ROW_LIMIT}`;
     const numericRows = await query(numericSql);
     if (numericRows.some(([, value]) => value != null)) {
-      return new Map(numericRows.map(([ts, value]) => [String(ts), value]));
+      return {
+        column: new Map(numericRows.map(([ts, value]) => [String(ts), value])),
+        empty: false,
+      };
     }
     if (period > 0) entry.method = "last";
     const stringSql =
@@ -172,11 +192,51 @@ export function createHistoryApiProvider(
         ? `SELECT ts, last(value_str) as value_str, last(value_kind) as value_kind FROM signalk_str WHERE ${where} SAMPLE BY ${period}s FILL(NULL) ORDER BY ts`
         : `SELECT ts, value_str, value_kind FROM signalk_str WHERE ${where} ORDER BY ts LIMIT ${RAW_ROW_LIMIT}`;
     const stringRows = await query(stringSql);
-    return new Map(
-      stringRows.map(([ts, text, kind]) => [
-        String(ts),
-        kind === "boolean" ? text === "true" : text,
-      ]),
+    return {
+      column: new Map(
+        stringRows.map(([ts, text, kind]) => [
+          String(ts),
+          decodeText(text, kind),
+        ]),
+      ),
+      empty: !stringRows.some(([, text]) => text != null),
+    };
+  }
+
+  async function objectColumn(
+    objects: ObjectReader,
+    spec: history.PathSpec,
+    sourceClause: string,
+    period: number,
+  ): Promise<Column> {
+    if (!(await objects.hasLeaves(spec.path))) return new Map();
+    const { aggregate } = spec;
+    if (aggregate === "middle_index") {
+      const deltas = await objects.deltas(
+        spec.path,
+        sourceClause,
+        CLIENT_AGGREGATE_ROW_LIMIT,
+      );
+      return deltaColumn(deltas, middleIndex(deltas.map((d) => d.fields)));
+    }
+    const refuse = (): Error =>
+      new Error(
+        `Aggregate ${aggregate} does not apply to object path ${spec.path}: use first, last or middle_index`,
+      );
+    if (period > 0) {
+      if (aggregate !== "first" && aggregate !== "last") throw refuse();
+      return objects.sampled({
+        path: spec.path,
+        sourceClause,
+        aggregate,
+        period,
+      });
+    }
+    if (aggregate === "sma" || aggregate === "ema") throw refuse();
+    const deltas = await objects.deltas(spec.path, sourceClause, RAW_ROW_LIMIT);
+    return deltaColumn(
+      deltas,
+      deltas.map((d) => d.fields),
     );
   }
 
@@ -187,7 +247,13 @@ export function createHistoryApiProvider(
     const rows = await query(
       `SELECT DISTINCT path FROM signalk WHERE ${where} UNION SELECT DISTINCT path FROM signalk_str WHERE ${where} UNION SELECT DISTINCT 'navigation.position' path FROM signalk_position WHERE ${where} ORDER BY path`,
     );
-    return rows.map((row) => String(row[0])) as history.PathsResponse;
+    const paths = new Set(
+      rows.map((row) => {
+        const name = String(row[0]);
+        return objectPathOf(name) ?? name;
+      }),
+    );
+    return [...paths] as history.PathsResponse;
   }
 
   async function getContexts(
@@ -234,6 +300,24 @@ function guardSampleBuckets(
   }
 }
 
+function sqlAggregate(aggregate: string): string {
+  return Object.hasOwn(SQL_AGGREGATES, aggregate)
+    ? SQL_AGGREGATES[aggregate]
+    : SQL_AGGREGATES.average;
+}
+
+function smooth(
+  spec: history.PathSpec,
+  values: (number | null)[],
+): (number | null)[] {
+  const parameter = Number(spec.parameter?.[0]);
+  return spec.aggregate === "sma"
+    ? simpleMovingAverage(values, parameter)
+    : spec.aggregate === "ema"
+      ? exponentialMovingAverage(values, parameter)
+      : middleIndex(values);
+}
+
 export function simpleMovingAverage(
   values: (number | null)[],
   parameter: number,
@@ -265,7 +349,7 @@ export function exponentialMovingAverage(
   });
 }
 
-export function middleIndex(values: (number | null)[]): (number | null)[] {
+export function middleIndex<T>(values: (T | null)[]): (T | null)[] {
   const keep = Math.floor(values.length / 2);
   return values.map((value, i) => (i === keep ? value : null));
 }

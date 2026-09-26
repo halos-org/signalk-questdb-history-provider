@@ -1,5 +1,7 @@
 import type { QueryRows } from "../storage/sql-client.js";
 import { errorMessage } from "../storage/tables.js";
+import { fieldName, objectPathOf } from "../storage/pointer.js";
+import { setValue, type Fields } from "./objects.js";
 
 export const PLAYBACK_WINDOW_MS = 60000;
 export const PAGE_LIMIT = 10000;
@@ -102,40 +104,107 @@ export function decodeValue(text: unknown, kind: unknown): unknown {
   }
 }
 
-/** Groups rows by (ts, context, source) into deltas, in order of first appearance. */
+const storedContextOf = (context: unknown): string =>
+  context === null || context === undefined || context === ""
+    ? STORED_SELF
+    : String(context);
+
+const millisecondOf = (ts: unknown): number => new Date(String(ts)).getTime();
+
+interface Group {
+  delta: Delta;
+  objects: Map<string, Fields>;
+}
+
+/**
+ * Groups rows by (ts, context, source) into deltas, in order of first
+ * appearance, with the pointer rows of one object path merged into one
+ * object value.
+ */
 export function groupRows(rows: unknown[][]): Delta[] {
-  const byTimestamp = new Map<string, Map<string, Delta>>();
+  const byKey = new Map<string, Map<string, Group>>();
   for (const [ts, path, context, source, text, kind] of rows) {
+    const objectPath = objectPathOf(String(path));
     const timestamp = String(ts);
-    const storedContext =
-      context === null || context === undefined || context === ""
-        ? STORED_SELF
-        : String(context);
+    const storedContext = storedContextOf(context);
     const sourceRef = typeof source === "string" ? source : undefined;
     const groupKey = `${storedContext}\n${sourceRef === undefined ? "\0" : `s:${sourceRef}`}`;
 
-    let groups = byTimestamp.get(timestamp);
+    let groups = byKey.get(timestamp);
     if (!groups) {
       groups = new Map();
-      byTimestamp.set(timestamp, groups);
+      byKey.set(timestamp, groups);
     }
-    let delta = groups.get(groupKey);
-    if (!delta) {
+    let group = groups.get(groupKey);
+    if (!group) {
       const update: DeltaUpdate = { timestamp, values: [] };
       if (sourceRef !== undefined) update.$source = sourceRef;
-      delta = { context: storedContext, updates: [update] };
-      groups.set(groupKey, delta);
+      group = {
+        delta: { context: storedContext, updates: [update] },
+        objects: new Map(),
+      };
+      groups.set(groupKey, group);
     }
+    const values = group.delta.updates[0].values;
     const value = decodeValue(text, kind);
-    delta.updates[0].values.push(
-      path === IDENTITY_PATH && kind === "identity" && typeof value === "string"
-        ? { path: "", value: { name: value } }
-        : { path: String(path), value },
-    );
+    if (objectPath === null) {
+      values.push(
+        path === IDENTITY_PATH &&
+          kind === "identity" &&
+          typeof value === "string"
+          ? { path: "", value: { name: value } }
+          : { path: String(path), value },
+      );
+      continue;
+    }
+    let fields = group.objects.get(objectPath);
+    if (!fields) {
+      fields = {};
+      group.objects.set(objectPath, fields);
+      values.push({ path: objectPath, value: fields });
+    }
+    if (value !== null) {
+      setValue(fields, {
+        field: fieldName(String(path)),
+        value,
+        numeric: kind === "number",
+      });
+    }
   }
   const deltas: Delta[] = [];
-  for (const groups of byTimestamp.values()) deltas.push(...groups.values());
+  for (const groups of byKey.values()) {
+    for (const group of groups.values()) deltas.push(group.delta);
+  }
   return deltas;
+}
+
+/**
+ * Gives every pointer row of one object path and context the ts and source
+ * of its newest row, so grouping merges the snapshot's latest leaves into
+ * one object.
+ */
+function stampObjects(rows: unknown[][]): unknown[][] {
+  const stamps = new Map<string, { ts: string; source: unknown }>();
+  const stampKey = (path: unknown, context: unknown): string | null => {
+    const objectPath = objectPathOf(String(path));
+    return objectPath === null
+      ? null
+      : JSON.stringify([objectPath, storedContextOf(context)]);
+  };
+  for (const [ts, path, context, source] of rows) {
+    const key = stampKey(path, context);
+    if (key === null) continue;
+    const best = stamps.get(key);
+    if (!best || String(ts) > best.ts)
+      stamps.set(key, { ts: String(ts), source });
+  }
+  return rows.map((row) => {
+    const key = stampKey(row[1], row[2]);
+    const stamp = key === null ? undefined : stamps.get(key);
+    return stamp === undefined
+      ? row
+      : [stamp.ts, row[1], row[2], stamp.source, row[4], row[5]];
+  });
 }
 
 export function createPlaybackProvider(
@@ -158,7 +227,7 @@ export function createPlaybackProvider(
   ) => {
     const at = date.toISOString();
     query(snapshotSql(at)).then(
-      (rows) => callback(groupRows(rows)),
+      (rows) => callback(groupRows(stampObjects(rows))),
       (error) => {
         debug(`getHistory error: ${errorMessage(error)}`);
         callback([]);
@@ -192,11 +261,9 @@ export function createPlaybackProvider(
       const found = new Map<string, string>();
       try {
         for (const [context, name] of await query(namesSql(start))) {
-          const stored =
-            context === null || context === undefined || context === ""
-              ? STORED_SELF
-              : String(context);
-          if (typeof name === "string" && name !== "") found.set(stored, name);
+          if (typeof name === "string" && name !== "") {
+            found.set(storedContextOf(context), name);
+          }
         }
       } catch {
         return found;
@@ -217,7 +284,19 @@ export function createPlaybackProvider(
           schedule(EMPTY_WINDOW_DELAY_MS);
           return;
         }
-        const deltas = groupRows(rows);
+        let page = rows;
+        let resume = windowEnd.getTime();
+        if (rows.length >= PAGE_LIMIT) {
+          const lastMs = millisecondOf(rows[rows.length - 1][0]);
+          const earlier = rows.filter((r) => millisecondOf(r[0]) < lastMs);
+          if (earlier.length > 0) {
+            page = earlier;
+            resume = Math.min(lastMs, resume);
+          } else {
+            resume = Math.min(lastMs + 1, resume);
+          }
+        }
+        const deltas = groupRows(page);
         if (names === null) {
           names = await lookupNames();
           if (stopped) return;
@@ -242,12 +321,7 @@ export function createPlaybackProvider(
           socket.write({ ...delta, context });
         }
         if (rows.length >= PAGE_LIMIT) {
-          const lastRowMs = new Date(
-            String(rows[rows.length - 1][0]),
-          ).getTime();
-          const resume =
-            lastRowMs > cursor.getTime() ? lastRowMs : cursor.getTime() + 1;
-          cursor = new Date(Math.min(resume, windowEnd.getTime()));
+          cursor = new Date(resume);
           schedule(0);
         } else {
           cursor = windowEnd;

@@ -218,6 +218,8 @@ describe("sampling gate", () => {
 
 interface Harness {
   samples: Sample[];
+  /** One entry per emit call: the samples of one delta. */
+  deltas: Sample[][];
   handle: (delta: DeltaLike) => void;
   recorder: Recorder;
 }
@@ -228,6 +230,7 @@ function harness(
 ): Harness {
   const cfg = effectiveConfig(stored);
   const samples: Sample[] = [];
+  const deltas: Sample[][] = [];
   const recorder = new Recorder({
     selfContext: SELF,
     recordSelf: cfg.recordSelf,
@@ -235,10 +238,18 @@ function harness(
     filter: new PathFilter(cfg.pathFilter.mode, cfg.pathFilter.paths),
     sampling: new SamplingPolicy(cfg.defaultSamplingRate, cfg.samplingRates),
     gate: new SamplingGate(),
-    emit: (sample) => samples.push(sample),
+    emit: (batch) => {
+      deltas.push([...batch]);
+      samples.push(...batch);
+    },
     now,
   });
-  return { samples, recorder, handle: (delta) => recorder.handle(delta) };
+  return {
+    samples,
+    deltas,
+    recorder,
+    handle: (delta) => recorder.handle(delta),
+  };
 }
 
 const paths = (samples: Sample[]): (string | undefined)[] =>
@@ -374,7 +385,7 @@ describe("vessel identity deltas", () => {
     assert.deepEqual(h.samples, [
       {
         kind: "string",
-        path: "navigation.state.name",
+        path: "navigation.state#/name",
         context: "self",
         source: undefined,
         value: "x",
@@ -508,7 +519,7 @@ describe("routing by kind", () => {
     "navigation.courseGreatCircle.nextPoint.position",
     "steering.autopilot.target.position",
   ]) {
-    it(`a position under ${path} is flattened`, () => {
+    it(`a position under ${path} is split into pointer leaves`, () => {
       const samples = one({
         path,
         value: { latitude: 12.05, longitude: -61.75 },
@@ -520,70 +531,60 @@ describe("routing by kind", () => {
           (s as { value: unknown }).value,
         ]),
         [
-          ["numeric", `${path}.latitude`, 12.05],
-          ["numeric", `${path}.longitude`, -61.75],
+          ["numeric", `${path}#/latitude`, 12.05],
+          ["numeric", `${path}#/longitude`, -61.75],
         ],
       );
     });
   }
 
-  it("a half position is flattened", () => {
+  for (const value of [
+    { latitude: 1 },
+    { latitude: NaN, longitude: 13.4 },
+    { latitude: "52.5", longitude: 13.4 },
+    { latitude: 52.5, longitude: Infinity },
+  ]) {
+    it(`a half position ${JSON.stringify(value)} produces nothing`, () => {
+      assert.deepEqual(one({ path: "navigation.position", value }), []);
+    });
+  }
+
+  it("a half position opens no sampling window", () => {
+    const h = harness({});
+    h.handle({
+      path: "navigation.position",
+      value: { latitude: 52.5 },
+      context: SELF,
+    });
+    h.handle({
+      path: "navigation.position",
+      value: { latitude: 52.5, longitude: 13.4 },
+      context: SELF,
+    });
     assert.deepEqual(
-      paths(one({ path: "navigation.position", value: { latitude: 1 } })),
-      ["navigation.position.latitude"],
+      h.samples.map((s) => s.kind),
+      ["position"],
     );
   });
 
-  it("an attitude object is flattened", () => {
+  it("an attitude object is split into pointer leaves", () => {
     assert.deepEqual(
       one({ path: "navigation.attitude", value: { roll: 0.1, pitch: 0 } }).map(
-        (s) => (s as { value: unknown }).value,
+        (s) => [
+          s.kind,
+          "path" in s ? s.path : "",
+          (s as { value: unknown }).value,
+        ],
       ),
-      [0.1, 0],
+      [
+        ["numeric", "navigation.attitude#/roll", 0.1],
+        ["numeric", "navigation.attitude#/pitch", 0],
+      ],
     );
   });
 
   it("a null position produces nothing", () => {
     assert.deepEqual(one({ path: "navigation.position", value: null }), []);
-  });
-
-  it("a NaN latitude drops that leaf only", () => {
-    assert.deepEqual(
-      paths(
-        one({
-          path: "navigation.position",
-          value: { latitude: NaN, longitude: 13.4 },
-        }),
-      ),
-      ["navigation.position.longitude"],
-    );
-  });
-
-  it("a string latitude becomes a text leaf", () => {
-    const samples = one({
-      path: "navigation.position",
-      value: { latitude: "52.5", longitude: 13.4 },
-    });
-    assert.deepEqual(
-      samples.map((s) => [s.kind, "path" in s ? s.path : ""]),
-      [
-        ["string", "navigation.position.latitude"],
-        ["numeric", "navigation.position.longitude"],
-      ],
-    );
-    assert.equal((samples[0] as { valueKind?: string }).valueKind, undefined);
-  });
-
-  it("an infinite longitude drops that leaf only", () => {
-    assert.deepEqual(
-      paths(
-        one({
-          path: "navigation.position",
-          value: { latitude: 52.5, longitude: Infinity },
-        }),
-      ),
-      ["navigation.position.latitude"],
-    );
   });
 
   for (const value of [NaN, Infinity, -Infinity]) {
@@ -613,12 +614,47 @@ describe("routing by kind", () => {
       filter: new PathFilter("exclude", []),
       sampling: new SamplingPolicy(2000, {}),
       gate: new SamplingGate(),
-      emit: (sample) => {
-        (sample.context as string).replace(",", "");
+      emit: (batch) => {
+        for (const sample of batch) (sample.context as string).replace(",", "");
       },
     });
     assert.throws(() => recorder.handle({ path: "a.b", value: 1 }), TypeError);
     assert.doesNotThrow(() => recorder.handle({ path: "a.b", value: 1 }));
+  });
+});
+
+describe("meta deltas", () => {
+  it("records nothing for a meta object", () => {
+    const h = harness({});
+    h.handle({
+      path: "navigation.speedOverGround",
+      value: { units: "m/s", description: "Speed over ground" },
+      context: SELF,
+      isMeta: true,
+    });
+    assert.deepEqual(h.samples, []);
+  });
+
+  it("records nothing for a meta scalar", () => {
+    const h = harness({});
+    h.handle({
+      path: "navigation.speedOverGround",
+      value: 6.4,
+      context: SELF,
+      isMeta: true,
+    });
+    assert.deepEqual(h.samples, []);
+  });
+
+  it("records a delta whose isMeta is false", () => {
+    const h = harness({});
+    h.handle({
+      path: "navigation.speedOverGround",
+      value: 6.4,
+      context: SELF,
+      isMeta: false,
+    });
+    assert.deepEqual(paths(h.samples), ["navigation.speedOverGround"]);
   });
 });
 
@@ -629,23 +665,24 @@ describe("flattening objects", () => {
     return h.samples;
   };
 
-  it("flattens three numeric leaves in key order", () => {
-    const samples = one(
-      {},
-      {
-        path: "navigation.attitude",
-        value: { roll: 0.02, pitch: -0.01, yaw: 1.57 },
-      },
-    );
+  const ATTITUDE = { roll: 0.02, pitch: -0.01, yaw: 1.57 };
+
+  it("records three pointer leaves in key order as one delta", () => {
+    const h = harness({});
+    h.handle({ path: "navigation.attitude", value: ATTITUDE, context: SELF });
     assert.deepEqual(
-      samples.map((s) => [
-        "path" in s ? s.path : "",
-        (s as { value: unknown }).value,
-      ]),
+      h.deltas.map((batch) =>
+        batch.map((s) => [
+          "path" in s ? s.path : "",
+          (s as { value: unknown }).value,
+        ]),
+      ),
       [
-        ["navigation.attitude.roll", 0.02],
-        ["navigation.attitude.pitch", -0.01],
-        ["navigation.attitude.yaw", 1.57],
+        [
+          ["navigation.attitude#/roll", 0.02],
+          ["navigation.attitude#/pitch", -0.01],
+          ["navigation.attitude#/yaw", 1.57],
+        ],
       ],
     );
   });
@@ -666,9 +703,9 @@ describe("flattening objects", () => {
         (s as { valueKind?: string }).valueKind,
       ]),
       [
-        ["numeric", "some.thing.count", 3, undefined],
-        ["string", "some.thing.label", "port", undefined],
-        ["string", "some.thing.active", "true", "boolean"],
+        ["numeric", "some.thing#/count", 3, undefined],
+        ["string", "some.thing#/label", "port", undefined],
+        ["string", "some.thing#/active", "true", "boolean"],
       ],
     );
   });
@@ -681,7 +718,7 @@ describe("flattening objects", () => {
           { path: "sensor.x", value: { good: 1.5, bad: NaN, worse: Infinity } },
         ),
       ),
-      ["sensor.x.good"],
+      ["sensor.x#/good"],
     );
   });
 
@@ -696,7 +733,7 @@ describe("flattening objects", () => {
           },
         ),
       ),
-      ["a.b.flat"],
+      ["a.b#/flat"],
     );
   });
 
@@ -711,19 +748,39 @@ describe("flattening objects", () => {
           },
         ),
       ),
-      ["a.b.present"],
+      ["a.b#/present"],
     );
+  });
+
+  it("escapes keys per RFC 6901 and skips an empty key", () => {
+    assert.deepEqual(
+      paths(one({}, { path: "a.b", value: { "a/b": 1, "a~b": 2, "": 3 } })),
+      ["a.b#/a~1b", "a.b#/a~0b"],
+    );
+  });
+
+  it("escapes ~ before / so ~1 in a key stays distinct", () => {
+    assert.deepEqual(paths(one({}, { path: "a.b", value: { "~1": 1 } })), [
+      "a.b#/~01",
+    ]);
   });
 
   it("an empty object produces nothing", () => {
     assert.deepEqual(one({}, { path: "a.b", value: {} }), []);
   });
 
+  it("an empty object opens no sampling window", () => {
+    const h = harness({});
+    h.handle({ path: "a.b", value: {}, context: SELF });
+    h.handle({ path: "a.b", value: { x: 1 }, context: SELF });
+    assert.deepEqual(paths(h.samples), ["a.b#/x"]);
+  });
+
   it("an array produces nothing", () => {
     assert.deepEqual(one({}, { path: "a.b", value: [1, 2] }), []);
   });
 
-  it("flattens an anchor position in key order", () => {
+  it("splits an anchor position in key order", () => {
     assert.deepEqual(
       paths(
         one(
@@ -735,52 +792,59 @@ describe("flattening objects", () => {
         ),
       ),
       [
-        "navigation.anchor.position.latitude",
-        "navigation.anchor.position.longitude",
+        "navigation.anchor.position#/latitude",
+        "navigation.anchor.position#/longitude",
       ],
     );
   });
 
-  it("filters each leaf in include mode", () => {
+  it("a literal exclude of the object path records no leaf", () => {
     assert.deepEqual(
-      paths(
-        one(
-          {
-            pathFilter: {
-              mode: "include",
-              paths: ["navigation.attitude.roll"],
-            },
-          },
-          { path: "navigation.attitude", value: { roll: 0.02, pitch: -0.01 } },
-        ),
+      one(
+        { pathFilter: { mode: "exclude", paths: ["navigation.attitude"] } },
+        { path: "navigation.attitude", value: ATTITUDE },
       ),
-      ["navigation.attitude.roll"],
+      [],
     );
   });
 
-  it("a literal parent pattern excludes no leaf", () => {
+  it("an include of one dotted field records nothing for the object", () => {
     assert.deepEqual(
-      paths(
-        one(
-          { pathFilter: { mode: "exclude", paths: ["navigation.attitude"] } },
-          { path: "navigation.attitude", value: { roll: 0.02, pitch: -0.01 } },
-        ),
+      one(
+        {
+          pathFilter: { mode: "include", paths: ["navigation.attitude.roll"] },
+        },
+        { path: "navigation.attitude", value: { roll: 0.02, pitch: -0.01 } },
       ),
-      ["navigation.attitude.roll", "navigation.attitude.pitch"],
+      [],
     );
   });
 
-  it("leaves share windows with top-level deltas at the same path", () => {
-    const h = harness({});
-    h.handle({ path: "navigation.attitude.roll", value: 1, context: SELF });
-    h.handle({
-      path: "navigation.attitude",
-      value: { roll: 2, pitch: 3 },
-      context: SELF,
-    });
-    assert.deepEqual(paths(h.samples), [
-      "navigation.attitude.roll",
-      "navigation.attitude.pitch",
-    ]);
+  it("a rate on the object path throttles all leaves together", () => {
+    let t = 1700000000000;
+    const h = harness(
+      {
+        defaultSamplingRate: 0,
+        samplingRates: { "navigation.attitude": 1000 },
+      },
+      () => t,
+    );
+    for (const step of [0, 500, 500]) {
+      t += step;
+      h.handle({ path: "navigation.attitude", value: ATTITUDE, context: SELF });
+    }
+    assert.deepEqual(
+      h.deltas.map((batch) => batch.length),
+      [3, 3],
+    );
+  });
+
+  it("an object shares its window with a scalar at the same path", () => {
+    let t = 1700000000000;
+    const h = harness({}, () => t);
+    h.handle({ path: "navigation.attitude", value: 1, context: SELF });
+    t += 1;
+    h.handle({ path: "navigation.attitude", value: ATTITUDE, context: SELF });
+    assert.deepEqual(paths(h.samples), ["navigation.attitude"]);
   });
 });

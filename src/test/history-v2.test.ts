@@ -498,7 +498,11 @@ describe("sample bucket guard", () => {
     const f = fixture();
     await f.provider.getValues(request({ resolution: 0.5 }));
     assert.ok(f.sqls.some((s) => s.includes("signalk_str")));
-    assert.ok(f.sqls.every((s) => s.includes("SAMPLE BY 1s")));
+    assert.ok(
+      f.sqls
+        .filter((s) => s.includes("SAMPLE BY"))
+        .every((s) => s.includes("SAMPLE BY 1s")),
+    );
     assert.ok(f.sqls.every((s) => !s.includes("SAMPLE BY 0s")));
   });
 
@@ -559,9 +563,13 @@ describe("sample bucket guard", () => {
           pathSpecs: [spec({ aggregate, parameter: [...parameter] })],
         }),
       );
-      assert.equal(f.sqls.length, 1);
+      assert.equal(f.sqls.length, 3);
       assert.ok(f.sqls[0].includes("LIMIT 50000"));
-      assert.ok(!f.sqls[0].includes("SAMPLE BY"));
+      assert.ok(
+        f.sqls[1].includes("FROM signalk_str") && f.sqls[1].endsWith("LIMIT 1"),
+      );
+      assert.ok(f.sqls[2].includes("SELECT DISTINCT path, 'signalk' tbl"));
+      assert.ok(f.sqls.every((s) => !s.includes("SAMPLE BY")));
     });
   }
 });
@@ -924,7 +932,7 @@ describe("client-side aggregate parameters", () => {
       }),
     );
     assert.deepEqual(r.data, []);
-    assert.equal(f.sqls.length, 1);
+    assert.ok(f.sqls.every((s) => !s.includes("SELECT ts, value_str")));
   });
 });
 
@@ -991,5 +999,702 @@ describe("aggregate names", () => {
     );
     assert.ok(f.sqls[0].includes("avg(value)"), f.sqls[0]);
     assert.equal(result.values[0].method, "bogus");
+  });
+});
+
+describe("object-valued paths", () => {
+  const B0 = "2024-01-01T00:00:00.000000Z";
+  const B1 = "2024-01-01T00:01:00.000000Z";
+  const B2 = "2024-01-01T00:02:00.000000Z";
+  const T1 = "2024-01-01T00:00:01.000100Z";
+  const T2 = "2024-01-01T00:00:01.000200Z";
+  const T3 = "2024-01-01T00:00:01.000300Z";
+  const P = "navigation.attitude";
+  const ROLL = `${P}#/roll`;
+  const PITCH = `${P}#/pitch`;
+  const YAW = `${P}#/yaw`;
+
+  type Rows = unknown[][];
+  interface Answers {
+    q1?: Rows;
+    q3?: Rows;
+    q4?: Rows;
+    discover?: Rows;
+    q11?: Rows;
+    q13?: Rows;
+    q14?: Rows;
+    q15?: Rows;
+    q16?: Rows;
+    q17?: Rows;
+  }
+
+  const isDiscovery = (sql: string): boolean =>
+    sql.includes("SELECT DISTINCT path, 'signalk' tbl");
+  const BOUND = "2024-01-01T00:59:00.000000Z";
+  const isQ11 = (sql: string): boolean => sql.startsWith("SELECT max(ts) FROM");
+  const isQ13 = (sql: string): boolean =>
+    sql.includes("arrival FROM signalk WHERE");
+  const isQ14 = (sql: string): boolean =>
+    sql.includes("arrival FROM signalk_str WHERE");
+  const isQ15 = (sql: string): boolean =>
+    sql.startsWith("SELECT ts, source, path, value FROM signalk WHERE");
+  const isQ16 = (sql: string): boolean =>
+    sql.startsWith("SELECT ts, source, path, value_str");
+
+  // Q13 and Q14 test rows carry the leaf name after the bucket; a per-leaf
+  // statement returns its leaf's rows without it.
+  const perLeaf = (sql: string, rows: Rows = []): Rows => {
+    const leaf = /path = '((?:[^']|'')*)'/.exec(sql)?.[1].replace(/''/g, "'");
+    return rows
+      .filter((r) => r[1] === leaf)
+      .map(([bucket, , ...rest]) => [bucket, ...rest]);
+  };
+
+  const objects = (a: Answers = {}): Fixture =>
+    fixture((sql) => {
+      if (isDiscovery(sql))
+        return (
+          a.discover ?? [
+            [ROLL, "signalk"],
+            [PITCH, "signalk"],
+            [YAW, "signalk"],
+          ]
+        );
+      if (isQ11(sql)) return a.q11 ?? [[BOUND]];
+      if (isQ13(sql)) return perLeaf(sql, a.q13);
+      if (isQ14(sql)) return perLeaf(sql, a.q14);
+      if (isQ15(sql)) return a.q15 ?? [];
+      if (isQ16(sql)) return a.q16 ?? [];
+      if (sql.startsWith("SELECT ts FROM signalk_str")) return a.q17 ?? [];
+      if (sql.includes("LIMIT 50000")) return a.q3 ?? [];
+      if (sql.includes("FROM signalk_str")) return a.q4 ?? [];
+      return a.q1 ?? [];
+    });
+
+  const attitude = (
+    over: Record<string, unknown> = {},
+    requestOver: Record<string, unknown> = {},
+  ): history.ValuesRequest =>
+    request({
+      context: "self",
+      resolution: 60,
+      pathSpecs: [spec({ path: P, ...over })],
+      ...requestOver,
+    });
+
+  const firstData = async (
+    a: Answers,
+    over: Record<string, unknown> = {},
+    requestOver: Record<string, unknown> = {},
+  ): Promise<unknown> =>
+    (await objects(a).provider.getValues(attitude(over, requestOver))).data;
+
+  const refusal = (aggregate: string, path = P): { message: string } => ({
+    message: `Aggregate ${aggregate} does not apply to object path ${path}: use first, last or middle_index`,
+  });
+
+  it("refuses a downsampled average after discovery", async () => {
+    const f = objects();
+    await assert.rejects(f.provider.getValues(attitude()), refusal("average"));
+    assert.equal(f.sqls.length, 3);
+    assert.ok(f.sqls[0].includes("agg_value"));
+    assert.ok(f.sqls[1].includes("last(value_str) as value_str"));
+    assert.ok(isDiscovery(f.sqls[2]));
+  });
+
+  for (const aggregate of ["min", "max", "mid", "bogus", "constructor"]) {
+    it(`refuses ${aggregate} on an object path`, async () => {
+      const f = objects();
+      await assert.rejects(
+        f.provider.getValues(attitude({ aggregate })),
+        refusal(aggregate),
+      );
+      assert.equal(f.sqls.length, 3);
+    });
+  }
+
+  it("takes every field of the latest delta under last, one leaf per statement", async () => {
+    const f = objects({
+      q13: [
+        [B0, ROLL, 3, T2],
+        [B0, PITCH, 2, T2],
+        [B0, YAW, 1, T2],
+      ],
+    });
+    const r = await f.provider.getValues(attitude({ aggregate: "last" }));
+    assert.equal(f.sqls.length, 7);
+    const w1 =
+      "ts >= '2024-01-01T00:00:00.000Z' AND ts <= '2024-01-01T01:00:00.000Z' AND context = 'self'";
+    assert.equal(
+      f.sqls[2],
+      `SELECT DISTINCT path, 'signalk' tbl FROM signalk WHERE ${w1} UNION SELECT DISTINCT path, 'signalk_str' tbl FROM signalk_str WHERE ${w1}`,
+    );
+    assert.equal(f.sqls[3], "SELECT max(ts) FROM signalk");
+    assert.equal(
+      f.sqls[4],
+      `SELECT ts, last(value) value, max(ts) arrival FROM signalk WHERE ${w1} AND path = '${ROLL}' AND ts < '${BOUND}' SAMPLE BY 60s ORDER BY ts`,
+    );
+    assert.ok(f.sqls[5].includes(`path = '${PITCH}'`));
+    assert.ok(f.sqls[6].includes(`path = '${YAW}'`));
+    assert.ok(f.sqls.slice(3).every((q) => !q.includes("signalk_str")));
+    assert.deepEqual(r.data, [[B0, { roll: 3, pitch: 2, yaw: 1 }]]);
+    assert.equal(r.values[0].method, "last");
+  });
+
+  it("takes the earliest delta under first", async () => {
+    const f = objects({ q13: [[B0, ROLL, 1, T1]] });
+    const r = await f.provider.getValues(attitude({ aggregate: "first" }));
+    assert.ok(
+      f.sqls.find(isQ13)?.includes("first(value) value, min(ts) arrival"),
+    );
+    assert.deepEqual(r.data, [[B0, { roll: 1 }]]);
+  });
+  it("bounds every leaf statement by its table's newest ts", async () => {
+    const f = objects({ q11: [[T2]] });
+    await f.provider.getValues(attitude({ aggregate: "last" }));
+    const leafReads = f.sqls.filter(isQ13);
+    assert.equal(leafReads.length, 3);
+    assert.ok(leafReads.every((q) => q.includes(`AND ts < '${T2}' SAMPLE BY`)));
+    assert.equal(f.sqls.filter(isQ11).length, 1);
+  });
+
+  it("leaves the leaf statements unbounded when the table has no max", async () => {
+    const f = objects({ q11: [[null]] });
+    await f.provider.getValues(attitude({ aggregate: "last" }));
+    const leafReads = f.sqls.filter(isQ13);
+    assert.equal(leafReads.length, 3);
+    assert.ok(leafReads.every((q) => /path = '[^']*' SAMPLE BY/.test(q)));
+  });
+
+  it("refuses an unreadable table bound", async () => {
+    const f = objects({ q11: [["not a timestamp"]] });
+    await assert.rejects(
+      f.provider.getValues(attitude({ aggregate: "last" })),
+      { message: "Unreadable max(ts) of signalk: not a timestamp" },
+    );
+    assert.equal(f.sqls.filter(isQ13).length, 0);
+  });
+
+  it("does not mix fields of different deltas under last", async () => {
+    assert.deepEqual(
+      await firstData(
+        {
+          q13: [
+            [B0, ROLL, 2, T2],
+            [B0, PITCH, 1, T1],
+          ],
+        },
+        { aggregate: "last" },
+      ),
+      [[B0, { roll: 2 }]],
+    );
+  });
+
+  it("orders deltas in one millisecond by arrival", async () => {
+    const rows = [
+      [B0, ROLL, 1, T1],
+      [B0, PITCH, 1, T1],
+      [B0, ROLL, 2, T2],
+    ];
+    assert.deepEqual(await firstData({ q13: rows }, { aggregate: "last" }), [
+      [B0, { roll: 2 }],
+    ]);
+    assert.deepEqual(await firstData({ q13: rows }, { aggregate: "first" }), [
+      [B0, { roll: 1, pitch: 1 }],
+    ]);
+  });
+
+  it("takes the later of two same-millisecond deltas under last", async () => {
+    assert.deepEqual(
+      await firstData({ q13: [[B0, ROLL, 2, T2]] }, { aggregate: "last" }),
+      [[B0, { roll: 2 }]],
+    );
+  });
+
+  it("reads a text-only object from its text leaves", async () => {
+    const M = "notifications.mob";
+    const f = objects({
+      discover: [
+        [`${M}#/state`, "signalk_str"],
+        [`${M}#/message`, "signalk_str"],
+        [`${M}#/on`, "signalk_str"],
+      ],
+      q14: [
+        [B0, `${M}#/state`, "normal", null, T2],
+        [B0, `${M}#/message`, "y", null, T2],
+        [B0, `${M}#/on`, "true", "boolean", T2],
+      ],
+    });
+    const r = await f.provider.getValues(
+      attitude({ path: M, aggregate: "last" }),
+    );
+    assert.ok(f.sqls.every((s) => !isQ13(s)));
+    assert.deepEqual(f.sqls.filter(isQ11), ["SELECT max(ts) FROM signalk_str"]);
+    const q14 = f.sqls.find(isQ14) ?? "";
+    assert.ok(
+      q14.includes(
+        "SELECT ts, last(value_str) value_str, last(value_kind) value_kind, max(ts) arrival",
+      ),
+      q14,
+    );
+    assert.deepEqual(r.data, [
+      [B0, { state: "normal", message: "y", on: true }],
+    ]);
+  });
+
+  it("reduces a field with numbers and text as a number", async () => {
+    assert.deepEqual(
+      await firstData(
+        {
+          discover: [
+            [ROLL, "signalk"],
+            [ROLL, "signalk_str"],
+          ],
+          q13: [[B0, ROLL, 1, T1]],
+          q14: [[B0, ROLL, "x", null, T1]],
+        },
+        { aggregate: "last" },
+      ),
+      [[B0, { roll: 1 }]],
+    );
+  });
+
+  it("nulls an empty bucket inside the timeline and omits absent fields", async () => {
+    assert.deepEqual(
+      await firstData(
+        {
+          q13: [
+            [B0, ROLL, 1, T1],
+            [B0, PITCH, 2, T1],
+            [B2, ROLL, 3, "2024-01-01T00:02:01.000100Z"],
+          ],
+        },
+        { aggregate: "last" },
+      ),
+      [
+        [B0, { roll: 1, pitch: 2 }],
+        [B1, null],
+        [B2, { roll: 3 }],
+      ],
+    );
+  });
+
+  it("unescapes pointer keys", async () => {
+    const names = [`${P}#/a~1b`, `${P}#/c~0d`, `${P}#/~01`];
+    assert.deepEqual(
+      await firstData(
+        {
+          discover: names.map((n) => [n, "signalk"]),
+          q13: names.map((n, i) => [B0, n, i + 1, T1]),
+        },
+        { aggregate: "last" },
+      ),
+      [[B0, { "a/b": 1, "c~d": 2, "~1": 3 }]],
+    );
+  });
+
+  it("keeps a field named __proto__ as an own field", async () => {
+    const name = `${P}#/__proto__`;
+    const data = (await firstData(
+      { discover: [[name, "signalk"]], q13: [[B0, name, 1, T1]] },
+      { aggregate: "last" },
+    )) as [string, Record<string, unknown>][];
+    assert.ok(Object.hasOwn(data[0][1], "__proto__"));
+    assert.equal(JSON.stringify(data[0][1]), '{"__proto__":1}');
+    const raw = (await firstData(
+      { discover: [[name, "signalk"]], q15: [[T1, "a", name, 1]] },
+      {},
+      { resolution: undefined },
+    )) as [string, unknown][];
+    assert.equal(JSON.stringify(raw[0][1]), '{"__proto__":1}');
+  });
+
+  it("quotes a leaf name holding an apostrophe", async () => {
+    const f = objects({
+      discover: [["q#/it's", "signalk"]],
+      q13: [[B0, "q#/it's", 5, T1]],
+    });
+    const r = await f.provider.getValues(
+      attitude({ path: "q", aggregate: "last" }),
+    );
+    const q13 = f.sqls.find(isQ13) ?? "";
+    assert.ok(q13.includes("path = 'q#/it''s'"), q13);
+    assert.deepEqual(r.data, [[B0, { "it's": 5 }]]);
+  });
+
+  it("selects leaves by prefix in the provider, without LIKE", async () => {
+    const f = objects({
+      discover: [
+        ["a_b#/x", "signalk"],
+        ["aXb#/x", "signalk"],
+      ],
+      q13: [[B0, "a_b#/x", 1, T1]],
+    });
+    const r = await f.provider.getValues(
+      attitude({ path: "a_b", aggregate: "last" }),
+    );
+    assert.deepEqual(
+      f.sqls.filter(isQ13).map((q) => q.includes("path = 'a_b#/x'")),
+      [true],
+    );
+    assert.equal(f.sqls.length, 5);
+    assert.ok(f.sqls.every((s) => !/LIKE|starts_with|aXb/i.test(s)));
+    assert.deepEqual(r.data, [[B0, { x: 1 }]]);
+  });
+
+  it("filters the object read, not discovery, by sourceRef", async () => {
+    const f = objects({ q13: [[B0, ROLL, 1, T1]] });
+    await f.provider.getValues(
+      attitude({ aggregate: "last", sourceRef: "gps.main" }),
+    );
+    assert.ok(!f.sqls[2].includes("source ="), f.sqls[2]);
+    const q13 = f.sqls.find(isQ13) ?? "";
+    assert.ok(q13.includes("AND source = 'gps.main'"), q13);
+  });
+
+  it("stops after discovery when the path has no leaves", async () => {
+    const f = objects({ discover: [] });
+    const r = await f.provider.getValues(attitude());
+    assert.equal(f.sqls.length, 3);
+    assert.deepEqual(r.data, []);
+    assert.equal(r.values[0].method, "last");
+  });
+
+  it("discovers once per request", async () => {
+    const f = objects({ q13: [[B0, ROLL, 1, T1]] });
+    await f.provider.getValues(
+      request({
+        context: "self",
+        resolution: 60,
+        pathSpecs: [
+          spec({ path: P, aggregate: "last" }),
+          spec({ path: "notifications.mob", aggregate: "last" }),
+        ],
+      }),
+    );
+    assert.equal(f.sqls.filter(isDiscovery).length, 1);
+    assert.deepEqual(f.sqls.filter(isQ11), ["SELECT max(ts) FROM signalk"]);
+  });
+
+  it("returns the numeric series when scalar rows exist", async () => {
+    const f = objects({ q1: [[B0, 4.2]], q13: [[B0, ROLL, 1, T1]] });
+    const r = await f.provider.getValues(attitude());
+    assert.equal(f.sqls.length, 1);
+    assert.deepEqual(r.data, [[B0, 4.2]]);
+  });
+
+  it("returns the string series when scalar text rows exist", async () => {
+    const f = objects({
+      q4: [[B0, "on", null]],
+      q13: [[B0, ROLL, 1, T1]],
+    });
+    const r = await f.provider.getValues(attitude());
+    assert.equal(f.sqls.length, 2);
+    assert.deepEqual(r.data, [[B0, "on"]]);
+  });
+
+  const rawRows = [
+    [T1, "a", ROLL, 1],
+    [T2, "b", ROLL, 2],
+    [T3, null, PITCH, 3],
+  ];
+
+  it("reads one object per delta when raw", async () => {
+    const f = objects({ q15: rawRows });
+    const r = await f.provider.getValues(
+      attitude({}, { resolution: undefined }),
+    );
+    assert.equal(f.sqls[3], "SELECT max(ts) FROM signalk");
+    assert.equal(
+      f.sqls[4],
+      `SELECT ts, source, path, value FROM signalk WHERE ts >= '2024-01-01T00:00:00.000Z' AND ts <= '2024-01-01T01:00:00.000Z' AND context = 'self' AND path IN ('${ROLL}', '${PITCH}', '${YAW}') AND ts < '${BOUND}' ORDER BY ts LIMIT 30001`,
+    );
+    assert.deepEqual(r.data, [
+      [T1, { roll: 1 }],
+      [T2, { roll: 2 }],
+      [T3, { pitch: 3 }],
+    ]);
+    assert.equal(r.values[0].method, "average");
+  });
+
+  const MODE = `${P}#/mode`;
+  const msAt = (d: number, micros = "123"): string =>
+    new Date(Date.UTC(2024, 0, 1) + d).toISOString().replace("Z", `${micros}Z`);
+  /** Three-field deltas, one per millisecond from `from` on. */
+  const attitudeRows = (count: number, from = 0): unknown[][] =>
+    Array.from({ length: count }, (_, i) => {
+      const ts = msAt(from + i);
+      return [
+        [ts, "a", ROLL, i],
+        [ts, "a", PITCH, i],
+        [ts, "a", YAW, i],
+      ];
+    }).flat();
+  const raw = async (a: Answers): Promise<unknown[][]> =>
+    (await firstData(a, {}, { resolution: undefined })) as unknown[][];
+
+  it("keeps an exactly full read whole", async () => {
+    const rows = attitudeRows(10000);
+    const last = msAt(9998, "456");
+    rows.splice(
+      -3,
+      3,
+      [last, "a", ROLL, 0],
+      [last, "a", PITCH, 0],
+      [last, "a", YAW, 0],
+    );
+    assert.equal(rows.length, 30000);
+    assert.equal((await raw({ q15: rows })).length, 10000);
+  });
+
+  it("drops the partial last delta of a truncated read", async () => {
+    const rows = [...attitudeRows(10000), [msAt(9999, "456"), "a", ROLL, 0]];
+    assert.equal(rows.length, 30001);
+    assert.equal((await raw({ q15: rows })).length, 10000);
+  });
+
+  const withMode: Rows = [
+    [ROLL, "signalk"],
+    [PITCH, "signalk"],
+    [YAW, "signalk"],
+    [MODE, "signalk_str"],
+  ];
+
+  it("drops a truncated delta and the other table's rows at its ts", async () => {
+    const rows = [...attitudeRows(10000), [msAt(10000), "a", ROLL, 1]];
+    assert.equal(rows.length, 30001);
+    const data = await raw({
+      discover: withMode,
+      q15: rows,
+      q16: [[msAt(10000), "a", MODE, "x", null]],
+    });
+    assert.equal(data.length, 10000);
+    assert.ok(
+      data.every(([, fields]) => !Object.hasOwn(fields as object, "mode")),
+    );
+  });
+
+  it("cuts at a truncated text read", async () => {
+    const text = Array.from({ length: 9999 }, (_, i) => [
+      msAt(i),
+      "a",
+      MODE,
+      `m${i}`,
+      null,
+    ]);
+    text.push(
+      [msAt(9999, "100"), "a", MODE, "last", null],
+      [msAt(9999, "200"), "0", MODE, "cut", null],
+    );
+    const f = objects({
+      discover: [
+        [ROLL, "signalk"],
+        [MODE, "signalk_str"],
+      ],
+      q15: [[msAt(9999, "300"), "0", ROLL, 1]],
+      q16: text,
+    });
+    const r = await f.provider.getValues(
+      attitude({}, { resolution: undefined }),
+    );
+    assert.ok(f.sqls.find(isQ16)?.endsWith("LIMIT 10001"));
+    const data = r.data as unknown[][];
+    assert.equal(data.length, 10000);
+    assert.ok(
+      data.every(([, fields]) => !Object.hasOwn(fields as object, "roll")),
+    );
+  });
+
+  for (const [aggregate, numeric, text, at] of [
+    ["first", 3, "x", "100"],
+    ["last", 2, "y", "200"],
+  ] as const) {
+    it(`reads the fields at the ${aggregate} ts`, async () => {
+      const arrival = msAt(0, at);
+      const f = objects({
+        discover: [
+          [ROLL, "signalk"],
+          [MODE, "signalk_str"],
+        ],
+        q13: [[B0, ROLL, numeric, arrival]],
+        q14: [[B0, MODE, text, null, arrival]],
+      });
+      const r = await f.provider.getValues(attitude({ aggregate }));
+      const [take, edge] =
+        aggregate === "first" ? ["first", "min"] : ["last", "max"];
+      assert.ok(
+        f.sqls
+          .find(isQ13)
+          ?.startsWith(`SELECT ts, ${take}(value) value, ${edge}(ts) arrival`),
+      );
+      assert.deepEqual(r.data, [[B0, { roll: numeric, mode: text }]]);
+    });
+  }
+
+  it("keeps a truncated read that falls at one ts", async () => {
+    const rows = Array.from({ length: 30001 }, (_, i) => [
+      T1,
+      `s${String(i).padStart(5, "0")}`,
+      ROLL,
+      i,
+    ]);
+    const data = await raw({ q15: rows });
+    assert.equal(data.length, 1);
+  });
+
+  const client: Answers = {
+    discover: [
+      [ROLL, "signalk"],
+      [PITCH, "signalk"],
+      [YAW, "signalk"],
+      [`${P}#/mode`, "signalk_str"],
+    ],
+    q15: [
+      [T1, "a", ROLL, 0],
+      [T1, "a", PITCH, 10],
+      [T2, "a", ROLL, 10],
+      [T3, "a", ROLL, 20],
+      [T3, "a", PITCH, 30],
+    ],
+    q16: [[T1, "a", `${P}#/mode`, "x", null]],
+  };
+
+  it("refuses sma after discovery", async () => {
+    const f = objects(client);
+    await assert.rejects(
+      f.provider.getValues(attitude({ aggregate: "sma", parameter: ["2"] })),
+      refusal("sma"),
+    );
+    assert.equal(f.sqls.length, 3);
+    assert.ok(f.sqls[0].includes("LIMIT 50000"), f.sqls[0]);
+    assert.equal(
+      f.sqls[1],
+      `SELECT ts FROM signalk_str WHERE ts >= '2024-01-01T00:00:00.000Z' AND ts <= '2024-01-01T01:00:00.000Z' AND context = 'self' AND path = '${P}' LIMIT 1`,
+    );
+    assert.ok(isDiscovery(f.sqls[2]));
+  });
+
+  it("refuses ema", async () => {
+    await assert.rejects(
+      objects(client).provider.getValues(
+        attitude({ aggregate: "ema", parameter: ["0.5"] }),
+      ),
+      refusal("ema"),
+    );
+  });
+
+  it("refuses ema on a raw read too", async () => {
+    await assert.rejects(
+      objects(client).provider.getValues(
+        attitude({ aggregate: "ema" }, { resolution: undefined }),
+      ),
+      refusal("ema"),
+    );
+  });
+
+  it("keeps the whole middle delta with middle_index", async () => {
+    const f = objects(client);
+    const r = await f.provider.getValues(
+      attitude({ aggregate: "middle_index" }),
+    );
+    assert.equal(f.sqls.length, 7);
+    assert.ok(isDiscovery(f.sqls[2]));
+    assert.equal(f.sqls[3], "SELECT max(ts) FROM signalk");
+    assert.ok(isQ15(f.sqls[4]) && f.sqls[4].endsWith("LIMIT 150001"));
+    assert.equal(f.sqls[5], "SELECT max(ts) FROM signalk_str");
+    assert.ok(isQ16(f.sqls[6]) && f.sqls[6].endsWith("LIMIT 50001"));
+    assert.deepEqual(r.data, [
+      [T1, null],
+      [T2, { roll: 10 }],
+      [T3, null],
+    ]);
+    assert.deepEqual(
+      await firstData(
+        {
+          discover: [
+            [ROLL, "signalk"],
+            [`${P}#/mode`, "signalk_str"],
+          ],
+          q15: [
+            [T1, "a", ROLL, 0],
+            [T2, "a", ROLL, 1],
+          ],
+          q16: [[T2, "a", `${P}#/mode`, "x", null]],
+        },
+        { aggregate: "middle_index" },
+      ),
+      [
+        [T1, null],
+        [T2, { roll: 1, mode: "x" }],
+      ],
+    );
+  });
+
+  it("keeps a later non-null value when deltas share a timestamp", async () => {
+    const next = "2024-01-01T00:00:01.001100Z";
+    assert.deepEqual(
+      await firstData(
+        {
+          q15: [
+            [T1, "a", ROLL, 0],
+            [next, "a", ROLL, 1],
+            [next, "b", ROLL, 2],
+          ],
+        },
+        { aggregate: "middle_index" },
+      ),
+      [
+        [T1, null],
+        [next, { roll: 1 }],
+      ],
+    );
+  });
+
+  it("leaves a client-side column empty when scalar text rows exist", async () => {
+    const f = objects({ q17: [[B0]], q15: [[T1, "a", ROLL, 1]] });
+    const r = await f.provider.getValues(attitude({ aggregate: "sma" }));
+    assert.equal(f.sqls.length, 2);
+    assert.deepEqual(r.data, []);
+  });
+
+  it("keeps a numeric client-side column", async () => {
+    const f = objects({ q3: [[B0, 4]] });
+    const r = await f.provider.getValues(attitude({ aggregate: "sma" }));
+    assert.equal(f.sqls.length, 1);
+    assert.deepEqual(r.data, [[B0, 4]]);
+  });
+
+  it("leaves navigation.position unchanged", async () => {
+    const f = objects();
+    await f.provider.getValues(
+      attitude({ path: "navigation.position", aggregate: "first" }),
+    );
+    assert.equal(f.sqls.length, 1);
+    assert.ok(f.sqls[0].includes("signalk_position"));
+    assert.ok(!f.sqls[0].includes("DISTINCT"));
+  });
+});
+
+describe("object paths in discovery", () => {
+  const range = {
+    from: I("2024-01-01T00:00:00Z"),
+    to: I("2024-01-01T01:00:00Z"),
+  } as unknown as history.PathsRequest;
+
+  it("lists an object path once and no pointer name", async () => {
+    const f = fixture(() => [
+      ["navigation.attitude#/pitch"],
+      ["navigation.attitude#/roll"],
+      ["navigation.position"],
+    ]);
+    assert.deepEqual(await f.provider.getPaths(range), [
+      "navigation.attitude",
+      "navigation.position",
+    ]);
+  });
+
+  it("lists a scalar path with leaves once", async () => {
+    const f = fixture(() => [["a.b"], ["a.b#/x"], ["a.bc"]]);
+    assert.deepEqual(await f.provider.getPaths(range), ["a.b", "a.bc"]);
   });
 });

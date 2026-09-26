@@ -1,4 +1,5 @@
 import type { Sample } from "../ilp/line.js";
+import { pointerName } from "../storage/pointer.js";
 import type { PathFilter } from "./path-filter.js";
 import type { SamplingGate, SamplingPolicy } from "./sampling.js";
 
@@ -12,6 +13,7 @@ export interface DeltaLike {
   value?: unknown;
   context?: unknown;
   $source?: unknown;
+  isMeta?: unknown;
 }
 
 export interface RecorderOptions {
@@ -21,7 +23,8 @@ export interface RecorderOptions {
   filter: PathFilter;
   sampling: SamplingPolicy;
   gate: SamplingGate;
-  emit: (sample: Sample) => void;
+  /** Called once per recorded delta; its samples share one timestamp. */
+  emit: (samples: readonly Sample[]) => void;
   now?: () => number;
 }
 
@@ -47,7 +50,7 @@ const scalarOf = (value: unknown): Scalar | undefined => {
 /**
  * Turns one server delta into zero or more samples: identity rows, scalar
  * rows, one track row for a complete `navigation.position`, or one row per
- * scalar leaf of any other object.
+ * scalar leaf of any other object, under its pointer name.
  */
 export class Recorder {
   private readonly names = new Map<string, string>();
@@ -63,6 +66,7 @@ export class Recorder {
   }
 
   handle(delta: DeltaLike): void {
+    if (delta.isMeta === true) return;
     const { path, value, context } = delta;
     const source =
       typeof delta.$source === "string" && delta.$source !== ""
@@ -85,25 +89,45 @@ export class Recorder {
       return;
     }
     if (!isRecord(value)) return;
-    if (
-      path === POSITION_PATH &&
-      isFiniteNumber(value.latitude) &&
-      isFiniteNumber(value.longitude)
-    ) {
+    if (path === POSITION_PATH) {
+      if (!isFiniteNumber(value.latitude) || !isFiniteNumber(value.longitude)) {
+        return;
+      }
       if (!this.admits(path, stored)) return;
-      this.options.emit({
-        kind: "position",
-        context: stored,
-        source,
-        latitude: value.latitude,
-        longitude: value.longitude,
-      });
+      this.options.emit([
+        {
+          kind: "position",
+          context: stored,
+          source,
+          latitude: value.latitude,
+          longitude: value.longitude,
+        },
+      ]);
       return;
     }
+    this.object(path, value, stored, source);
+  }
+
+  private object(
+    path: string,
+    value: Record<string, unknown>,
+    stored: string,
+    source: string | undefined,
+  ): void {
+    const leaves: Sample[] = [];
     for (const [key, leaf] of Object.entries(value)) {
-      const leafScalar = scalarOf(leaf);
-      if (leafScalar) this.record(`${path}.${key}`, leafScalar, stored, source);
+      const scalar = key === "" ? undefined : scalarOf(leaf);
+      if (scalar) {
+        leaves.push({
+          ...scalar,
+          path: pointerName(path, key),
+          context: stored,
+          source,
+        });
+      }
     }
+    if (leaves.length === 0 || !this.admits(path, stored)) return;
+    this.options.emit(leaves);
   }
 
   private identity(
@@ -119,14 +143,16 @@ export class Recorder {
       return;
     }
     this.names.set(stored, name);
-    this.options.emit({
-      kind: "string",
-      path: IDENTITY_PATH,
-      context: stored,
-      source,
-      value: name,
-      valueKind: "identity",
-    });
+    this.options.emit([
+      {
+        kind: "string",
+        path: IDENTITY_PATH,
+        context: stored,
+        source,
+        value: name,
+        valueKind: "identity",
+      },
+    ]);
   }
 
   private record(
@@ -136,7 +162,7 @@ export class Recorder {
     source: string | undefined,
   ): void {
     if (!this.admits(path, stored)) return;
-    this.options.emit({ ...scalar, path, context: stored, source });
+    this.options.emit([{ ...scalar, path, context: stored, source }]);
   }
 
   private admits(path: string, stored: string): boolean {

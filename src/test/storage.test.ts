@@ -4,6 +4,7 @@
 import { describe, it, after, before } from "node:test";
 import assert from "node:assert/strict";
 import { validateIdentifier, validateTimestamp } from "../storage/validate.js";
+import { fieldName, objectPathOf, pointerName } from "../storage/pointer.js";
 import {
   applyRetention,
   createTables,
@@ -18,6 +19,21 @@ import {
   startFakeQuestDb,
   type FakeQuestDb,
 } from "./helpers.js";
+
+describe("pointer names", () => {
+  it("round-trips a key holding ~ and /", () => {
+    for (const key of ["a~/b", "~1", "/~0", "roll"]) {
+      const name = pointerName("navigation.attitude", key);
+      assert.equal(objectPathOf(name), "navigation.attitude");
+      assert.equal(fieldName(name), key);
+    }
+    assert.equal(pointerName("p", "a~/b"), "p#/a~0~1b");
+  });
+
+  it("finds no object path in a plain name", () => {
+    assert.equal(objectPathOf("navigation.attitude.roll"), null);
+  });
+});
 
 describe("identifier validation", () => {
   for (const value of [
