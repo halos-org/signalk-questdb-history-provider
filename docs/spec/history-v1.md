@@ -2,7 +2,7 @@
 
 ## Purpose
 
-The plugin registers one v1 history provider with the Signal K server through `app.registerHistoryProvider()`. The server calls it for three things: to ask whether any recorded data exists from a given start time, to replay recorded deltas over a WebSocket at a playback rate, and to build a snapshot of the last known value of every path at a given moment. The provider reads the three tables the plugin records into (`signalk`, `signalk_str`, `signalk_position`), reads them in one interleaved pass ordered by timestamp, decodes each stored row back into the value the live delta carried, groups rows into deltas that carry the recorded source as `$source`, and maps the stored own-vessel context back to the server's self context. It issues SQL over QuestDB's HTTP query endpoint and never writes.
+The plugin registers one v1 history provider with the Signal K server through `app.registerHistoryProvider()`. The server calls it for three things: to ask whether any recorded data exists from a given start time, to replay recorded deltas over a WebSocket at a playback rate, and to build a snapshot of the last known value of every path at a given moment. The provider reads the three tables the plugin records into (`signalk`, `signalk_str`, `signalk_position`), reads them in one interleaved pass ordered by timestamp, decodes each stored row back into the value the live delta carried, groups rows into deltas that carry the recorded source as `$source`, reassembles the leaves of an object-valued path into one object value at that path, and maps the stored own-vessel context back to the server's self context. It issues SQL over QuestDB's HTTP query endpoint and never writes.
 
 ## Interface constants
 
@@ -85,6 +85,14 @@ Snapshot (`getHistory`), with `<where>` = `ts <= '<at>'`; each branch is parenth
 (<numeric branch with tail  LATEST ON ts PARTITION BY path, context>) UNION ALL (<string branch with tail  LATEST ON ts PARTITION BY path, context>) UNION ALL (<position branch with tail  LATEST ON ts PARTITION BY context>)
 ```
 
+### Object leaves
+
+| Term        | Meaning                                                                                                                                                                                                                    |
+| ----------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Pointer row | A row whose `path` contains `#/`. The ingestion surface stores each field `k` of an object value at P under `P#/k`. Every other row, including one with a dotted name such as `navigation.attitude.roll`, is a _plain row_ |
+| Object path | The part of a pointer row's `path` before the first `#/`                                                                                                                                                                   |
+| Field name  | The rest of the `path`, unescaped per RFC 6901: `~1` becomes `/`, then `~0` becomes `~`                                                                                                                                    |
+
 ### Wire shapes
 
 Replayed delta:
@@ -136,11 +144,13 @@ Each row decodes to one delta value from its `valuetext` and `kind`:
 
 ### Grouping rows into deltas
 
-1. Rows group by the triple (`ts` text, context, source). Rows with no source form their own group per (`ts`, context), separate from every sourced group.
-2. Each group becomes one delta with exactly one update. The update carries `timestamp` = the `ts` text, `values` = the group's rows in input order, and `$source` = the source only when the group has one. A group without a source has no `$source` key at all.
-3. Deltas are emitted in order of first appearance of their `ts` among the input rows; within one `ts`, groups are emitted in order of first appearance.
-4. A row with `path` = `name`, `kind` = `identity`, and a string value becomes the value item `{ path: "", value: { name: <value> } }`. A row with `path` = `name` and any other kind stays `{ path: "name", value: <value> }`.
-5. The delta `context` at this stage is the stored context (`self` for the own vessel). Only playback resolves it (see below); the snapshot does not.
+1. A row's group key is the triple (`ts` text, context, source). Rows with no source form their own group per `ts` and context, separate from every sourced group. Every row of one delta shares one `ts` (ingestion surface), so a delta holding scalars and an object stays one delta, and two deltas in one millisecond stay two deltas.
+2. Each group becomes one delta with exactly one update. The update carries `timestamp` = the group's key text, `values` = the group's value items in order of first appearance, and `$source` = the source only when the group has one. A group without a source has no `$source` key at all.
+3. Deltas are emitted in order of first appearance of their key among the input rows; within one key, groups are emitted in order of first appearance.
+4. A plain row is one value item `{ path: <path>, value: <value> }`. A row with `path` = `name`, `kind` = `identity`, and a string value becomes the value item `{ path: "", value: { name: <value> } }`. A row with `path` = `name` and any other kind stays `{ path: "name", value: <value> }`.
+5. The pointer rows of one group that share an object path P become one value item `{ path: P, value: <object> }`, placed where P's first row appears. Each row sets its field name on the object to its decoded value. The field is an own property, so a field named `__proto__` is kept as data and the object's prototype is unchanged. A field whose value decodes to `null` is omitted.
+6. When one group holds two rows of one field, the later row in input order wins, except that a text value never replaces a number.
+7. The delta `context` at this stage is the stored context (`self` for the own vessel). Only playback resolves it (see below); the snapshot does not.
 
 ### `hasAnyData`
 
@@ -163,18 +173,18 @@ Each window read:
 
 1. `<from>` = cursor as ISO literal; `<to>` = cursor + 60 s as ISO literal. Issue the playback window read query above.
 2. If the result has no rows: set the cursor to `<to>` and schedule the next read after 100 ms. Nothing is written to the socket. This repeats without limit, including for windows after the newest recorded row and for windows in the future, until the stream is stopped.
-3. Otherwise group the rows into deltas.
+3. Otherwise cut a full page (rule 6), then group the remaining rows into deltas.
 4. Before the first delta of the whole stream is written, and only once per stream, issue the last-known-name lookup bound at the playback start time. The result gives each stored context (null or empty becomes `self`) its last-known name, the row's `value_str`; an empty string counts as no name. If the lookup fails, no context has a name, no debug message is written, and playback continues unlabeled. If the stream was stopped while the lookup was in flight, nothing more is written or scheduled.
 5. For each delta in order:
    1. If the stream has ended, stop writing; nothing more is scheduled.
    2. Resolve the context: a stored context of `self` becomes `app.selfContext`; any other context is unchanged.
    3. If the lookup gave the stored context a name, and no name delta has been written for that stored context yet in this stream, write the injected vessel-name delta first, with the resolved context and the delta's own `timestamp`. It has no `$source`. Each stored context receives at most one injected name delta per stream.
    4. Write the delta with the resolved context; everything else is unchanged.
-6. Full page (row count >= 10000): the window may hold more rows than one read returned, so the stream resumes inside the same window rather than skipping to `<to>`:
-   1. The resume point is the last returned row's `ts` parsed as a JS `Date`, that is truncated to milliseconds.
-   2. If the resume point is later than the cursor, the cursor moves to it. Rows at that millisecond that were already sent are sent again on the next read; rows at that millisecond that did not fit in the page are not lost.
-   3. If the resume point equals the cursor (every row of the page shares the cursor's millisecond), the cursor moves forward by 1 ms so the read cannot repeat forever. Rows in that millisecond beyond the 10000 returned are skipped.
-   4. The cursor never moves past `<to>`: it is `min(resume point, <to>)`.
+6. Full page (row count >= 10000): the window may hold more rows than one read returned, so the stream resumes inside the same window rather than skipping to `<to>`. The page may also end inside a millisecond, and so inside a delta:
+   1. The last millisecond is the last returned row's `ts` parsed as a JS `Date`, that is truncated to milliseconds.
+   2. If some rows lie before the last millisecond, every row in the last millisecond is dropped before grouping, and after the writes the cursor moves to the last millisecond. The next read returns those rows again together with any in that millisecond that did not fit, so no delta is split across two pages and none is written twice.
+   3. If every row lies in the last millisecond, the whole page is grouped and written, and the cursor moves to 1 ms after the last millisecond so the read cannot repeat forever. Rows in that millisecond beyond the 10000 returned are skipped.
+   4. The cursor never moves past `<to>`.
    5. Schedule the next read after 0 ms.
 7. Non-full page: set the cursor to `<to>` and schedule the next read after `60000 / playbackRate` ms. At rate 1 that is 60 s of wall time per 60 s of history.
 8. Any error in the read, the grouping, or the name lookup (the lookup itself never throws; a failing lookup yields an empty map) writes `streamHistory error: <message>` to debug output and schedules the same window again after 1000 ms with the cursor unchanged. A permanent failure (for example a table missing an expected column) therefore repeats the query and the debug line once per second for as long as the stream runs.
@@ -192,9 +202,10 @@ Timers and stopping:
 
 1. `<at>` = `date` as an ISO literal. The `path` argument is accepted and not used: the query is never filtered by it, and every path in every context is returned. (The server passes the request URL segments in this argument and walks into the tree it builds from the returned deltas, so filtering would starve the snapshot.)
 2. Issue the snapshot query above. `LATEST ON` is applied inside each branch, per table, and the three results are unioned; it is not applied over the union. The numeric and string branches partition by `path, context`; the position branch partitions by `context` only.
-3. Because the partitions do not include `source`, the snapshot carries at most one row per (path, context) for values and one row per context for position: the latest row, whichever source wrote it.
-4. Group the rows into deltas (grouping rules above) and call `callback(deltas)`. The deltas carry the stored context; `self` is not mapped to `app.selfContext` here.
-5. On any error write `getHistory error: <message>` to debug output and call `callback([])`. Exactly one query attempt is made; there is no retry.
+3. Because the partitions do not include `source`, the snapshot carries at most one row per (path, context) for values and one row per context for position: the latest row, whichever source wrote it. For an object that is the latest row of each field, so its fields can come from different deltas.
+4. The pointer rows of one object path P and context become one object holding each field's newest value. The object is stamped with the newest `ts` among those rows and with the source of the row that has it, the first such row when several share that `ts`. Every one of those rows takes that `ts` and source before grouping, so the rows form one value item `{ path: P, value: <object> }` (grouping rule 5). A field with a row in both tables keeps the number (grouping rule 6).
+5. Group the rows into deltas (grouping rules above) and call `callback(deltas)`. The deltas carry the stored context; `self` is not mapped to `app.selfContext` here.
+6. On any error write `getHistory error: <message>` to debug output and call `callback([])`. Exactly one query attempt is made; there is no retry.
 
 ### Loud failure on a missing column
 
@@ -209,7 +220,8 @@ Timers and stopping:
 - `value_kind` tags written by the ingestion surface are `boolean`, `identity`, or null (plain string); this surface decodes exactly those, and treats an unknown tag as a plain string.
 - Vessel names are stored in `signalk_str` under path `name` with `value_kind` = `identity`; this surface replays them as empty-path `{ name }` object values and injects the last-known name per context at playback start.
 - The position table has no path column; this surface always projects `navigation.position` for it.
-- `ts` is the server receive time at microsecond precision; this surface replays it verbatim as the delta `timestamp` and truncates it to milliseconds only for cursor arithmetic.
+- `ts` is the server receive time at microsecond precision, one value per recorded delta; this surface replays it verbatim as the delta `timestamp` and truncates it to milliseconds for cursor arithmetic and for the page cut.
+- Object values are stored by the ingestion surface as pointer rows `P#/k`, one per field; this surface reassembles them. Rows with dotted names recorded before the change stay plain rows.
 - Timestamp literals in SQL use the format `YYYY-MM-DDTHH:mm:ss.sssZ`; the parsing error string `Invalid timestamp: <value>` and the HTTP error string `QuestDB query failed (<status>): <body>` come from the storage surface.
 - Debug output goes to `app.debug`.
 
@@ -223,7 +235,7 @@ None. The README states that v1 playback runs at configurable speed multipliers 
 - After the cursor passes the newest recorded row, playback issues an empty-window query every 100 ms indefinitely, including for windows in the future, until the socket ends.
 - A permanent query failure during playback (schema mismatch, unreachable database) retries and logs once per second for as long as the socket stays open; nothing ends the stream or informs the client.
 - A non-numeric `playbackRate` (NaN) is not clamped: the computed delay is NaN, which Node treats as 1 ms, so playback runs with no pacing.
-- When a page of 10000 rows all share the cursor's millisecond, the rows in that millisecond beyond the page are skipped silently.
+- When a page of 10000 rows all share one millisecond, the rows in that millisecond beyond the page are skipped silently. The page's last delta can be cut part-way, so an object can be written with fields missing. This happens only when one millisecond holds more than 10000 rows.
 - Position rows with more than two comma-separated parts decode from the first two parts without error.
 - A socket write that throws mid-window is retried as a window read: after 1000 ms every delta of that window written before the throwing write is written to the socket a second time.
 
@@ -272,12 +284,32 @@ None. The README states that v1 playback runs at configurable speed multipliers 
 
 ### Playback window reads (start `2024-01-01T00:00:00Z`)
 
-| Input / state                                                                                                                    | Action                                                       | Expected outcome                                                                                              |
-| -------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------- |
-| First read returns 10000 rows; rows 1 to 9999 at `00:00:00.000000Z`, row 10000 at `00:00:30.000000Z`; later reads return no rows | `streamHistory` at rate 1, wait for the second read, stop    | The second read's SQL contains `2024-01-01T00:00:30.000` (resumes at the last row, not at the window end)     |
-| First read returns 10000 rows; row 1 at `00:00:05.000000Z`, rows 2 to 10000 at `00:00:10.000000Z`                                | `streamHistory` at rate 1, wait for the second read, stop    | The second read's SQL contains `2024-01-01T00:00:10.000` (re-reads the tied millisecond)                      |
-| First read returns 10000 rows, all at `00:00:00.000000Z`                                                                         | `streamHistory` at rate 1, wait for the second read, stop    | The second read's SQL contains `2024-01-01T00:00:00.001` (steps forward by 1 ms)                              |
-| First read returns one row at `00:00:05.000000Z`; later reads return no rows                                                     | `streamHistory` at rate 6000, wait for the second read, stop | The second read's SQL contains `2024-01-01T00:01:00.000` (next 60 s window), and it arrives after about 10 ms |
+| Input / state                                                                                                                    | Action                                                       | Expected outcome                                                                                                                                |
+| -------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------- |
+| First read returns 10000 rows; rows 1 to 9999 at `00:00:00.000000Z`, row 10000 at `00:00:30.000000Z`; later reads return no rows | `streamHistory` at rate 1, wait for the second read, stop    | The second read's SQL contains `2024-01-01T00:00:30.000` (resumes at the last row, not at the window end)                                       |
+| First read returns 10000 rows; row 1 at `00:00:05.000000Z`, rows 2 to 10000 at `00:00:10.000000Z`                                | `streamHistory` at rate 1, wait for the second read, stop    | The second read's SQL contains `2024-01-01T00:00:10.000` (re-reads the tied millisecond); the first page wrote one delta, at `00:00:05.000000Z` |
+| First read returns 10000 rows, all at `00:00:00.000000Z`                                                                         | `streamHistory` at rate 1, wait for the second read, stop    | The second read's SQL contains `2024-01-01T00:00:00.001` (steps forward by 1 ms)                                                                |
+| First read returns 10000 rows, all at `00:00:10.000000Z`; later reads return no rows                                             | `streamHistory` at rate 1, wait for the second read, stop    | The second read's SQL contains `2024-01-01T00:00:10.001` (steps past the millisecond, not to it); the page was written once                     |
+| First read returns one row at `00:00:05.000000Z`; later reads return no rows                                                     | `streamHistory` at rate 6000, wait for the second read, stop | The second read's SQL contains `2024-01-01T00:01:00.000` (next 60 s window), and it arrives after about 10 ms                                   |
+
+### Object playback (start `2024-01-01T00:00:00Z`, rate 1)
+
+| Input / state                                                                                                                                                                                                                                                                         | Action                                         | Expected outcome                                                                                                                                                              |
+| ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Window holds `navigation.attitude#/roll` `0.1`, `#/pitch` `0.2`, `#/yaw` `0.3` (number), context `self`, source `n2k.1`, all at `00:00:05.000123Z`                                                                                                                                    | `streamHistory`, wait for one written delta    | One delta, `$source` `n2k.1`, `timestamp` `2024-01-01T00:00:05.000123Z`, values `[{ path: "navigation.attitude", value: { roll: 0.1, pitch: 0.2, yaw: 0.3 } }]`               |
+| Window holds two attitude deltas from `n2k.1`, one at `00:00:05.000000Z` (`roll` 1, `pitch` 2) and one at `00:00:05.000001Z` (`roll` 3, `pitch` 4)                                                                                                                                    | `streamHistory`, wait for two written deltas   | Two deltas in that order: `{ roll: 1, pitch: 2 }` at `.000000Z`, then `{ roll: 3, pitch: 4 }` at `.000001Z`                                                                   |
+| Window holds `navigation.attitude.roll` `0.1` (number) and `navigation.position` `60.1,24.9` at one `ts`, source `n2k.1`                                                                                                                                                              | `streamHistory`, wait for one written delta    | One delta with values `[{ path: "navigation.attitude.roll", value: 0.1 }, { path: "navigation.position", value: { latitude: 60.1, longitude: 24.9 } }]`                       |
+| First read returns 10000 rows: 9996 `a.b` rows at `00:00:01.000000Z`, then at `00:00:05.000001Z` three attitude leaves from source `a` and at `00:00:05.000002Z` the `#/roll` leaf from source `b`; a read from `00:00:05.000` returns both attitude deltas whole (three leaves each) | `streamHistory`, wait for three written deltas | The second read's SQL contains `ts >= '2024-01-01T00:00:05.000Z'`; exactly two written deltas hold `navigation.attitude`, one per source, each with `roll`, `pitch` and `yaw` |
+| Window holds `a.b` `1`, `navigation.attitude#/roll` `1`, `c.d` `2`, `navigation.attitude#/pitch` `2` (number), all at one `ts` from one source                                                                                                                                        | `streamHistory`, wait for one written delta    | One delta with values `[{ path: "a.b", value: 1 }, { path: "navigation.attitude", value: { roll: 1, pitch: 2 } }, { path: "c.d", value: 2 }]`                                 |
+
+### Object snapshot
+
+| Input / state                                                                                                                                                                                                                                                                                                                                  | Action       | Expected outcome                                                                                                                                                                                                                                                                     |
+| ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| Snapshot returns `notifications.mob#/state` `emergency` at `00:00:02.000000Z` from source `a`, and `notifications.mob#/message` `MOB` at `00:00:01.000000Z` from source `b`, context `self`                                                                                                                                                    | `getHistory` | One delta, `timestamp` `2024-01-01T00:00:02.000000Z`, `$source` `a`, values `[{ path: "notifications.mob", value: { state: "emergency", message: "MOB" } }]`                                                                                                                         |
+| Snapshot returns, for `vessels.urn:mrn:imo:mmsi:244813000`, `design.aisShipType#/id` `70` (number) at `00:00:02.000000Z` from `a1` and `#/name` `Cargo` at `00:00:01.000000Z` from `a2`; for `vessels.urn:mrn:imo:mmsi:230000000`, `#/id` `36` (number) at `00:00:01.000000Z` from `b1` and `#/name` `Sailing` at `00:00:03.000000Z` from `b2` | `getHistory` | Two deltas. The `244813000` delta has `timestamp` `2024-01-01T00:00:02.000000Z`, `$source` `a1`, value `{ id: 70, name: "Cargo" }` at `design.aisShipType`; the `230000000` delta has `timestamp` `2024-01-01T00:00:03.000000Z`, `$source` `b2`, value `{ id: 36, name: "Sailing" }` |
+| Snapshot returns `x.y#/a~1b~0c` `1` and `x.y#/__proto__` `2` (number) at one `ts`                                                                                                                                                                                                                                                              | `getHistory` | One value at path `x.y` whose own properties are `a/b~c` = 1 and `__proto__` = 2; its prototype is `Object.prototype`                                                                                                                                                                |
+| Snapshot returns `x.y#/n` `5` (number) and `x.y#/n` `five` (string), both at one `ts`                                                                                                                                                                                                                                                          | `getHistory` | The value at `x.y` is `{ n: 5 }`                                                                                                                                                                                                                                                     |
 
 ### Vessel-name injection (start `2024-01-01T00:00:00Z`, rate 1, server self context `vessels.urn:mrn:imo:mmsi:123456789`)
 
