@@ -2,7 +2,7 @@
 
 QuestDB history provider for Signal K -- a drop-in replacement for signalk-to-influxdb and signalk-to-influxdb2.
 
-It records the vessel data Signal K carries -- numbers, strings, booleans, positions, and the scalar leaves of object values -- into QuestDB, and serves it back through both the modern v2 History API and the legacy v1 playback API. It connects to a QuestDB you run; running the database is not the plugin's job.
+It records the vessel data Signal K carries -- numbers, strings, booleans, positions, and the scalar fields of object values, one level deep -- into QuestDB, and serves it back through both the modern v2 History API and the legacy v1 playback API. It connects to a QuestDB you run; running the database is not the plugin's job.
 
 ## Requirements
 
@@ -95,6 +95,8 @@ With no default configured, the server uses whichever provider registered first.
 { "environment.wind.*": 200 }
 ```
 
+**Object values** such as `navigation.attitude` are filtered and sampled on their own path, as one unit: every field of a delta is stored, or none is. A pattern that names a field (`navigation.attitude.roll`), or a glob that matches only fields (`navigation.attitude.*`), no longer matches anything for that object; edit such entries to name the object path. Broad globs such as `navigation.*` keep working. Meta updates (units, descriptions) are not recorded.
+
 ## Reading the history
 
 ### v2 (REST -- `/signalk/v2/api/history/`)
@@ -164,6 +166,8 @@ The plugin creates and owns three tables, all with WAL mode, daily partitioning 
 | `signalk_position` | Positions      | `ts`, `context` (SYMBOL), `source` (SYMBOL), `lat` (DOUBLE), `lon` (DOUBLE)                                |
 
 `ts` is the **server receive time**, not the timestamp a source claims. Marine sources carry independent clocks, and storing their timestamps makes commits land out of order -- QuestDB then rewrites partition tails on every merge (observed as >3000x write amplification). Receive time keeps ingestion append-only; the millisecond difference is far below the sampling resolution, and a device with a broken clock gets more accurate history, not less.
+
+The fields of an object value are stored one row each under a pointer name, `<path>#/<field>` (for example `navigation.attitude#/roll`), with one `ts` shared by every field of the delta. A `/` or `~` in a field name is escaped as `~1` or `~0`. Earlier versions stored them as `navigation.attitude.roll`; those rows stay as they were, and new rows are no longer written under the dotted name, so a query for a dotted field stops growing. A `navigation.position` value whose latitude or longitude is missing, not a number, or not finite is not recorded at all.
 
 `source` is the delta's sourceRef -- which receiver produced the row. Two GPS units feeding the same server interleave in storage, and without the column a track drawn from history zigzags between them. Rows recorded before the column existed have `source` null; they replay unattributed and cannot be filtered.
 
