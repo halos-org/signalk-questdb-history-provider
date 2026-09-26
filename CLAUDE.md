@@ -63,6 +63,7 @@ Test conventions:
 - `src/test/ilp.test.ts` runs at the production timing constants with `mock.timers` from `node:test` and real sockets. Advance time with `mock.timers.tick`, then wait for real I/O with `waitFor`. Timers in `helpers.ts` are captured before the mocks are enabled.
 - `src/test/lifecycle.test.ts` runs with real timers and short timing through `createPlugin(app, timing)`.
 - Two `MaxListenersExceededWarning` lines on stderr during the ILP suite are expected: the spec records the drain-listener leak under backpressure as a defect.
+- `src/test/history-live.test.ts` covers the _live_ spec rows against a real QuestDB and is skipped unless `QUESTDB_URL` is set. It drops and recreates the plugin's tables, so point it at a throwaway instance: `docker run -d --rm -p 9000:9000 questdb/questdb:10.0.0`.
 - The packaging suite runs `npm pack --dry-run --offline` with a temporary cache directory, so it works in the registry's sandbox.
 
 ## Carried-over files

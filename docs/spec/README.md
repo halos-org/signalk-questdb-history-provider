@@ -21,7 +21,7 @@ Read them in that order. Each file lists the constants other files depend on und
 
 ## Test cases
 
-Each file ends with test-case tables, and every row has a unit test under `src/test/`. The one exception is a row marked _live_. It states what a real QuestDB 10 instance returns for the stored rows it describes, so it is covered by the opt-in live QuestDB suite, [signalk-questdb-history-provider#14](https://github.com/halos-org/signalk-questdb-history-provider/issues/14), rather than by a unit test.
+Each file ends with test-case tables, and every row has a unit test under `src/test/`. The one exception is a row marked _live_. It states what a real QuestDB 10 instance returns for the stored rows it describes, so it is covered by the opt-in live suite, `src/test/history-live.test.ts`, rather than by a unit test. The suite runs when `QUESTDB_URL` names a QuestDB 10 instance (`QUESTDB_URL=http://localhost:9000 node --test dist/test/history-live.test.js`), and in the Signal K integration workflow against its service container. It refuses to start when the plugin's tables hold rows it did not write; otherwise it drops and recreates them, and drops them again when it finishes.
 
 ## Constants shared across surfaces
 

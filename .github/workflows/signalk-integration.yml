@@ -70,6 +70,15 @@ jobs:
           npm run build
           echo "PLUGIN_TGZ=$(npm pack --ignore-scripts --pack-destination /tmp)" >> "$GITHUB_ENV"
 
+      - name: Live QuestDB suite
+        # The _live_ rows of docs/spec/history-v2.md, against the service
+        # container before the server writes to it: the suite drops and
+        # recreates the plugin's tables, drops them again when done, and
+        # refuses to run against rows it did not write.
+        env:
+          QUESTDB_URL: http://localhost:9000
+        run: node --test dist/test/history-live.test.js
+
       - name: Install signalk-server and the plugin
         run: |
           mkdir -p /tmp/sk-test && cd /tmp/sk-test
