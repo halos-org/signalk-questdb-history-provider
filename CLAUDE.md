@@ -32,6 +32,7 @@ A Signal K server plugin that records deltas into QuestDB over ILP and serves th
 | `src/history/time-range.ts`    | `from`, `to`, `duration` resolution with Temporal                                     |
 | `src/history/v2.ts`            | `registerHistoryApiProvider` provider                                                 |
 | `src/history/v1.ts`            | `registerHistoryProvider` playback provider                                           |
+| `src/history/objects.ts`       | Pointer-leaf discovery and reassembly for the v1 and v2 reads                         |
 
 The display name lives in three places: `signalk.displayName` in `package.json`, the `DISPLAY_NAME` constant in `src/index.ts`, and the README's search and navigation instructions. Change all three together.
 
