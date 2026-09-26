@@ -780,8 +780,8 @@ describe("sourceRef filtering", () => {
     const r = await f.provider.getValues(
       withContext([spec({ sourceRef: "gps.main" }), spec()]),
     );
-    assert.equal(r.values[0].sourceRef, "gps.main");
-    assert.ok(!("sourceRef" in r.values[1]));
+    assert.equal(r.values[0].$source, "gps.main");
+    assert.ok(!("$source" in r.values[1]));
   });
 
   it("gives one column per source", async () => {
@@ -815,6 +815,177 @@ describe("sourceRef filtering", () => {
       { message: "Invalid identifier: bad path" },
     );
     assert.ok(f.sqls.length >= 1);
+  });
+});
+
+describe("source policy", () => {
+  const TS = "2024-01-01T00:00:01.000000Z";
+  const P = "navigation.speedOverGround";
+  const Q18 =
+    "SELECT DISTINCT path, source FROM signalk WHERE ts >= '2024-01-01T00:00:00.000Z' AND ts <= '2024-01-01T01:00:00.000Z' AND context = 'self' UNION SELECT DISTINCT path, source FROM signalk_str WHERE ts >= '2024-01-01T00:00:00.000Z' AND ts <= '2024-01-01T01:00:00.000Z' AND context = 'self'";
+  const isQ18 = (sql: string): boolean =>
+    sql.startsWith("SELECT DISTINCT path, source");
+  const isQ19 = (sql: string): boolean =>
+    sql.startsWith("SELECT DISTINCT source FROM signalk_position");
+  const all = (
+    specs: history.PathSpec[],
+    over: Record<string, unknown> = {},
+  ): history.ValuesRequest =>
+    request({
+      context: "self",
+      sourcePolicy: "all",
+      pathSpecs: specs,
+      ...over,
+    });
+
+  it("issues no discovery without the policy", async () => {
+    const f = fixture(() => [[TS, 4.2]]);
+    const r = await f.provider.getValues(
+      request({ context: "self", pathSpecs: [spec()] }),
+    );
+    assert.ok(!f.sqls.some(isQ18));
+    assert.equal(r.values.length, 1);
+  });
+
+  it("treats another policy value as absent", async () => {
+    const f = fixture(() => [[TS, 4.2]]);
+    await f.provider.getValues(all([spec()], { sourcePolicy: "preferred" }));
+    assert.ok(!f.sqls.some(isQ18));
+  });
+
+  it("splits a path into one column per source, ordered by source", async () => {
+    const f = fixture((sql) => {
+      if (isQ18(sql))
+        return [
+          [P, "gps.main"],
+          [P, "gps.backup"],
+          ["other.path", "x"],
+        ];
+      return [[TS, sql.includes("'gps.main'") ? 1.1 : 2.2]];
+    });
+    const r = await f.provider.getValues(all([spec()]));
+    assert.equal(f.sqls[0], Q18);
+    assert.deepEqual(r.values, [
+      { path: P, method: "average", $source: "gps.backup" },
+      { path: P, method: "average", $source: "gps.main" },
+    ]);
+    assert.deepEqual(r.data, [[TS, 2.2, 1.1]]);
+  });
+
+  it("issues discovery once per request", async () => {
+    const f = fixture((sql) => (isQ18(sql) ? [[P, "a"]] : [[TS, 1]]));
+    await f.provider.getValues(all([spec(), spec({ aggregate: "max" })]));
+    assert.equal(f.sqls.filter(isQ18).length, 1);
+  });
+
+  it("keeps a specification with a sourceRef as a filter", async () => {
+    const f = fixture((sql) =>
+      isQ18(sql)
+        ? [
+            [P, "gps.main"],
+            [P, "gps.backup"],
+          ]
+        : [[TS, 1]],
+    );
+    const r = await f.provider.getValues(
+      all([spec({ sourceRef: "gps.main" }), spec()]),
+    );
+    assert.deepEqual(
+      r.values.map((v) => v.$source),
+      ["gps.main", "gps.backup", "gps.main"],
+    );
+  });
+
+  it("gives rows without a source their own unlabelled column", async () => {
+    const f = fixture((sql) =>
+      isQ18(sql)
+        ? [
+            [P, null],
+            [P, "gps.main"],
+          ]
+        : [[TS, 1]],
+    );
+    const r = await f.provider.getValues(all([spec()]));
+    assert.equal(r.values.length, 2);
+    assert.equal(r.values[0].$source, "gps.main");
+    assert.ok(!("$source" in r.values[1]));
+    const reads = f.sqls.filter((sql) => !isQ18(sql));
+    assert.ok(reads[reads.length - 1].includes("AND source IS NULL"));
+  });
+
+  it("quotes a stored source rather than validating it", async () => {
+    const f = fixture((sql) => (isQ18(sql) ? [[P, "My GPS's"]] : [[TS, 1]]));
+    const r = await f.provider.getValues(all([spec()]));
+    assert.ok(f.sqls[1].includes("AND source = 'My GPS''s'"));
+    assert.equal(r.values[0].$source, "My GPS's");
+  });
+
+  it("drops a path with no rows", async () => {
+    const f = fixture((sql) => (isQ18(sql) ? [["other.path", "x"]] : []));
+    const r = await f.provider.getValues(all([spec()]));
+    assert.deepEqual(r.values, []);
+    assert.deepEqual(r.data, []);
+    assert.equal(f.sqls.length, 1);
+  });
+
+  it("splits an object path by the sources of its leaves", async () => {
+    const f = fixture((sql) => {
+      if (isQ18(sql))
+        return [
+          ["navigation.attitude#/roll", "a"],
+          ["navigation.attitude#/pitch", "b"],
+        ];
+      if (sql.startsWith("SELECT DISTINCT path, 'signalk' tbl"))
+        return [
+          ["navigation.attitude#/roll", "signalk"],
+          ["navigation.attitude#/pitch", "signalk"],
+        ];
+      return [];
+    });
+    const r = await f.provider.getValues(
+      all([spec({ path: "navigation.attitude", aggregate: "last" })], {
+        resolution: 60,
+      }),
+    );
+    assert.deepEqual(
+      r.values.map((v) => v.$source),
+      ["a", "b"],
+    );
+    const leafReads = f.sqls.filter((sql) => sql.includes("arrival"));
+    assert.ok(leafReads.some((sql) => sql.includes("AND source = 'a'")));
+    assert.ok(leafReads.some((sql) => sql.includes("AND source = 'b'")));
+  });
+
+  it("splits the position path from its own table", async () => {
+    const f = fixture((sql) =>
+      isQ19(sql) ? [["gps.b"], ["gps.a"]] : [[TS, 60.1, 24.9]],
+    );
+    const r = await f.provider.getValues(
+      all([spec({ path: "navigation.position", aggregate: "first" })]),
+    );
+    assert.ok(!f.sqls.some(isQ18));
+    assert.equal(f.sqls.filter(isQ19).length, 1);
+    assert.deepEqual(
+      r.values.map((v) => v.$source),
+      ["gps.a", "gps.b"],
+    );
+    assert.ok(f.sqls[1].includes("signalk_position"));
+    assert.ok(f.sqls[1].includes("AND source = 'gps.a'"));
+  });
+
+  it("budgets the expanded columns in the bucket guard", async () => {
+    const sources = ["a", "b", "c", "d", "e", "f"].map((s) => [P, s]);
+    const f = fixture((sql) => (isQ18(sql) ? sources : []));
+    await assert.rejects(
+      f.provider.getValues(
+        all([spec()], {
+          to: I("2024-01-02T00:00:00Z"),
+          resolution: 1,
+        }),
+      ),
+      /1036800 sample buckets across 6 paths/,
+    );
+    assert.equal(f.sqls.length, 1);
   });
 });
 

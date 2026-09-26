@@ -7,6 +7,7 @@ import {
   createObjectReader,
   decodeText,
   deltaColumn,
+  literal,
   type Column,
   type ObjectReader,
 } from "./objects.js";
@@ -40,7 +41,16 @@ export interface HistoryApiProviderOptions {
 interface ValueEntry {
   path: string;
   method: string;
-  sourceRef?: string;
+  $source?: string;
+}
+
+/**
+ * One column to read. `stored` is set on a column expanded from a source by
+ * the source policy: the stored source, or null for rows stored without one.
+ */
+interface ColumnSpec {
+  spec: history.PathSpec;
+  stored?: string | null;
 }
 
 /**
@@ -72,6 +82,17 @@ export function createHistoryApiProvider(
         ? "self"
         : requestedContext;
     validateIdentifier(storedContext);
+    const contextWhere = `${rangeWhere(range)} AND context = '${storedContext}'`;
+
+    let columnSpecs: ColumnSpec[] = request.pathSpecs.map((spec) => ({ spec }));
+    if (request.sourcePolicy === "all") {
+      columnSpecs = await expandSources(request.pathSpecs, contextWhere);
+      guardSampleBuckets(
+        columnSpecs.map((c) => c.spec),
+        request.resolution,
+        range,
+      );
+    }
 
     const resolution = request.resolution;
     const sampled = typeof resolution === "number" && resolution > 0;
@@ -80,14 +101,23 @@ export function createHistoryApiProvider(
 
     const values: ValueEntry[] = [];
     const columns: Column[] = [];
-    for (const spec of request.pathSpecs) {
+    for (const { spec, stored } of columnSpecs) {
       validateIdentifier(spec.path);
-      const sourceRef = spec.sourceRef || undefined;
-      if (sourceRef) validateIdentifier(sourceRef);
       const entry: ValueEntry = { path: spec.path, method: spec.aggregate };
-      if (sourceRef) entry.sourceRef = sourceRef;
-      const source = sourceRef ? ` AND source = '${sourceRef}'` : "";
-      const contextWhere = `${rangeWhere(range)} AND context = '${storedContext}'`;
+      let source = "";
+      if (stored === undefined) {
+        const sourceRef = spec.sourceRef || undefined;
+        if (sourceRef) {
+          validateIdentifier(sourceRef);
+          entry.$source = sourceRef;
+          source = ` AND source = '${sourceRef}'`;
+        }
+      } else if (stored === null) {
+        source = " AND source IS NULL";
+      } else {
+        entry.$source = stored;
+        source = ` AND source = ${literal(stored)}`;
+      }
       const pathWhere = `${contextWhere} AND path = '${spec.path}'${source}`;
 
       let column: Column;
@@ -118,6 +148,60 @@ export function createHistoryApiProvider(
       values,
       data: assembleRows(columns),
     } as history.ValuesResponse;
+  }
+
+  /**
+   * Replaces each specification without a sourceRef by one per source with
+   * rows of its path, ordered by source, the rows without a source last.
+   */
+  async function expandSources(
+    specs: history.PathSpec[],
+    contextWhere: string,
+  ): Promise<ColumnSpec[]> {
+    let pathSources: Map<string, Set<string | null>> | undefined;
+    let positionSources: Set<string | null> | undefined;
+    const expanded: ColumnSpec[] = [];
+    for (const spec of specs) {
+      if (spec.sourceRef) {
+        expanded.push({ spec });
+        continue;
+      }
+      let sources: Set<string | null> | undefined;
+      if (spec.path === POSITION_PATH) {
+        positionSources ??= new Set(
+          (
+            await query(
+              `SELECT DISTINCT source FROM signalk_position WHERE ${contextWhere}`,
+            )
+          ).map(([source]) => storedSource(source)),
+        );
+        sources = positionSources;
+      } else {
+        pathSources ??= await sourcesByPath(contextWhere);
+        sources = pathSources.get(spec.path);
+      }
+      for (const stored of orderSources(sources ?? new Set())) {
+        expanded.push({ spec, stored });
+      }
+    }
+    return expanded;
+  }
+
+  /** Q18: the sources of every path, an object's leaves under its own path. */
+  async function sourcesByPath(
+    contextWhere: string,
+  ): Promise<Map<string, Set<string | null>>> {
+    const rows = await query(
+      `SELECT DISTINCT path, source FROM signalk WHERE ${contextWhere} UNION SELECT DISTINCT path, source FROM signalk_str WHERE ${contextWhere}`,
+    );
+    const byPath = new Map<string, Set<string | null>>();
+    for (const [name, source] of rows) {
+      const path = objectPathOf(String(name)) ?? String(name);
+      const sources = byPath.get(path) ?? new Set();
+      sources.add(storedSource(source));
+      byPath.set(path, sources);
+    }
+    return byPath;
   }
 
   async function positionColumn(
@@ -298,6 +382,15 @@ function guardSampleBuckets(
       `resolution ${resolution}s over this range produces up to ${buckets} sample buckets across ${sampledCount} paths (max ${MAX_SAMPLE_BUCKETS}) — use a coarser resolution or a shorter range`,
     );
   }
+}
+
+function storedSource(source: unknown): string | null {
+  return source == null ? null : String(source);
+}
+
+function orderSources(sources: Set<string | null>): (string | null)[] {
+  const named = [...sources].filter((s): s is string => s !== null).sort();
+  return sources.has(null) ? [...named, null] : named;
 }
 
 function sqlAggregate(aggregate: string): string {

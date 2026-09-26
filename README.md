@@ -141,7 +141,9 @@ Append `|<sourceRef>` to a path to read one source's rows only (server 2.29+, [s
 GET /signalk/v2/api/history/values?paths=navigation.position|gps.main,navigation.position|gps.backup&duration=PT1H
 ```
 
-Without a sourceRef a path returns all sources mixed, as before.
+Each such column is labelled with its source as `$source` in `values`. Without a sourceRef a path returns all sources mixed, as before.
+
+Add `sourcePolicy=all` to split every path without a sourceRef into one column per source that has rows of it in the range (server 2.32+, [signalk-server#2817](https://github.com/SignalK/signalk-server/pull/2817)), ordered by source and labelled with `$source`. Rows recorded without a source get their own column with no `$source`. A path with no rows in the range gets no column. Finding the sources scans the range once per request, as reading an object path does.
 
 ### v1 (WebSocket playback)
 
