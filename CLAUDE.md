@@ -8,7 +8,7 @@ A Signal K server plugin that records deltas into QuestDB over ILP and serves th
 
 - Every constant in the specification is fixed: the plugin id, config keys and titles, table names and DDL, ILP line shapes, status and error strings, log lines, timing values. Reproduce them exactly.
 - Each spec file has an _Observed defects_ heading. The code reproduces those defects on purpose. Fixing one is a separate change with its own issue, and the spec file changes with it.
-- Each spec file ends with test-case tables. Every row has a test under `src/test/`. A behaviour change adds or edits a row first.
+- Each spec file ends with test-case tables. Every row has a test under `src/test/`, except rows marked _live_, which the opt-in live suite covers (`docs/spec/README.md`). A behaviour change adds or edits a row first.
 - `README.md` and `docs/questdb-tuning.md` are operator documentation. The spec lists where they disagree with the code under _Disagreements with the README_.
 
 ## Layout
