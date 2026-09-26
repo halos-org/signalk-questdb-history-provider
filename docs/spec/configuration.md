@@ -240,7 +240,7 @@ The README table, verbatim:
 20. When the effective `pathFilter.paths` is empty, every path is recorded, whatever `pathFilter.mode` says.
 21. When `pathFilter.paths` is not empty, a path matches the filter when it equals an exact pattern or when any glob pattern matches it. A pattern is a glob when it contains a glob metacharacter (see the constants table); otherwise it is compared as an exact string. Glob patterns follow minimatch semantics.
 22. With `pathFilter.mode` equal to `"exclude"`, a matching path is not recorded and a non-matching path is recorded. With any other value of `pathFilter.mode`, a matching path is recorded and a non-matching path is not. Only the exact string `"exclude"` selects exclude behaviour.
-23. A delta whose value is an object is filtered on each flattened leaf path (for example `navigation.attitude.roll`), not on the parent path. A pattern that names only the parent path does not match the leaves unless it is a glob that covers them.
+23. A delta whose value is an object is filtered once, on the object's own path (for example `navigation.attitude`), never on its leaves: every leaf is recorded or none is. A pattern naming a dotted field such as `navigation.attitude.roll`, or a glob such as `navigation.attitude.*` that matches only fields, does not match the object.
 
 ### Sampling rates
 
@@ -249,7 +249,7 @@ The README table, verbatim:
 26. `samplingRates` maps a pattern to an interval in milliseconds and overrides `defaultSamplingRate` for the paths it matches. Matching follows the same exact-string and glob rules as the path filter.
 27. Override resolution, first match wins: an exact pattern equal to the path wins over any glob; among globs, the first matching entry in the object's key order wins.
 28. An override whose value is not a number greater than `0` (that is, `0`, a negative number, or `NaN`) is ignored. A path matched only by such an entry uses `defaultSamplingRate`.
-29. An object-valued delta is throttled on each leaf path with that leaf's rate, not on the parent path.
+29. An object-valued delta is throttled once, on the object's own path with that path's rate, so all its leaves are throttled together. The same reporting as rule 23 covers `samplingRates` entries that named fields.
 30. Vessel-name identity rows are throttled with the path `name` and the vessel's stored context. A `samplingRates` entry whose pattern matches the string `name` applies to them; otherwise `defaultSamplingRate` applies.
 
 ### Recording toggles
@@ -280,7 +280,7 @@ The README table, verbatim:
 - The owned tables `signalk`, `signalk_str`, `signalk_position` are created and repaired by the storage surface and receive the retention TTL from this surface.
 - The stored context `self` for the own vessel, and the raw context string for other vessels, is the sampling-rate key here and the `context` column value written by the ingestion surface.
 - Vessel-name identity rows use the path `name` and bypass the path filter but not the sampling rate; the ingestion surface defines how they are written.
-- Object-valued deltas are filtered and throttled per flattened leaf path; the ingestion surface defines the flattening.
+- Object-valued deltas are filtered and throttled once, on the object's path; the ingestion surface defines the flattening.
 - The retention value applied here is re-applied by the storage surface after it rebuilds a table.
 - The requirement that the plugin never claims the server's default history provider slot belongs to the lifecycle surface; this surface only guarantees the schema exposes no option for it.
 
