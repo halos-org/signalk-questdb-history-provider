@@ -369,8 +369,14 @@ describe("playback window reads", () => {
   async function secondRead(
     first: unknown[][],
     playbackRate = 1,
-  ): Promise<{ f: Fixture; second: string; elapsed: number }> {
+  ): Promise<{
+    f: Fixture;
+    socket: FakeSocket;
+    second: string;
+    elapsed: number;
+  }> {
     const started = Date.now();
+    const socket = fakeSocket();
     let secondAt = 0;
     const f = fixture((sql, index) => {
       if (isNames(sql)) return [];
@@ -379,7 +385,7 @@ describe("playback window reads", () => {
       return [];
     });
     const stop = f.provider.streamHistory(
-      fakeSocket(),
+      socket,
       { startTime: START, playbackRate },
       () => undefined,
     );
@@ -387,6 +393,7 @@ describe("playback window reads", () => {
     stop();
     return {
       f,
+      socket,
       second: f.sqls.filter(isWindow)[1],
       elapsed: secondAt - started,
     };
@@ -404,12 +411,16 @@ describe("playback window reads", () => {
   });
 
   it("re-reads a tied millisecond", async () => {
-    const { second } = await secondRead(
+    const { socket, second } = await secondRead(
       page((i) =>
         i === 0 ? "2024-01-01T00:00:05.000000Z" : "2024-01-01T00:00:10.000000Z",
       ),
     );
     assert.ok(second.includes("ts >= '2024-01-01T00:00:10.000"));
+    assert.deepEqual(
+      socket.written.map((d) => d.updates[0].timestamp),
+      ["2024-01-01T00:00:05.000000Z"],
+    );
   });
 
   it("steps one millisecond past a page that shares the cursor", async () => {
@@ -417,6 +428,15 @@ describe("playback window reads", () => {
       page(() => "2024-01-01T00:00:00.000000Z"),
     );
     assert.ok(second.includes("ts >= '2024-01-01T00:00:00.001"));
+  });
+
+  it("steps past a one-millisecond page later than the cursor", async () => {
+    const { socket, second } = await secondRead(
+      page(() => "2024-01-01T00:00:10.000000Z"),
+    );
+    assert.ok(second.includes("ts >= '2024-01-01T00:00:10.001"));
+    assert.equal(socket.written.length, 1);
+    assert.equal(socket.written[0].updates[0].values.length, 10000);
   });
 
   it("paces the next window by the playback rate", async () => {
@@ -664,6 +684,253 @@ describe("vessel-name injection", () => {
       socket.written[0].updates[0].values[0].path,
       "navigation.speedOverGround",
     );
+  });
+});
+
+describe("object playback", () => {
+  const START = T("2024-01-01T00:00:00Z");
+  const TS = "2024-01-01T00:00:05.000123Z";
+  const ATT = "navigation.attitude";
+  const leaf = (
+    ts: string,
+    field: string,
+    text: string,
+    source: string | null = "n2k.1",
+  ): unknown[] => row(ts, `${ATT}#/${field}`, "self", source, text, "number");
+
+  async function play(
+    answer: (sql: string) => unknown[][] | Error,
+    until: (socket: FakeSocket, f: Fixture) => boolean,
+  ): Promise<{ f: Fixture; socket: FakeSocket }> {
+    const f = fixture((sql) => (isNames(sql) ? [] : answer(sql)));
+    const socket = fakeSocket();
+    const stop = f.provider.streamHistory(
+      socket,
+      { startTime: START, playbackRate: 1 },
+      () => undefined,
+    );
+    await waitFor(() => until(socket, f), 100000);
+    stop();
+    return { f, socket };
+  }
+
+  const firstWindow =
+    (rows: unknown[][]) =>
+    (sql: string): unknown[][] | Error => {
+      return sql.includes("ts >= '2024-01-01T00:00:00.000Z'") ? rows : [];
+    };
+  const writes = (n: number) => (socket: FakeSocket) =>
+    socket.written.length >= n;
+
+  it("replays one attitude delta as one object", async () => {
+    const { socket } = await play(
+      firstWindow([
+        leaf(TS, "roll", "0.1"),
+        leaf(TS, "pitch", "0.2"),
+        leaf(TS, "yaw", "0.3"),
+      ]),
+      writes(1),
+    );
+    assert.equal(socket.written.length, 1);
+    const update = socket.written[0].updates[0];
+    assert.equal(update.$source, "n2k.1");
+    assert.equal(update.timestamp, TS);
+    assert.deepEqual(update.values, [
+      { path: ATT, value: { roll: 0.1, pitch: 0.2, yaw: 0.3 } },
+    ]);
+  });
+
+  it("keeps two deltas in one millisecond apart, in arrival order", async () => {
+    const a = "2024-01-01T00:00:05.000000Z";
+    const b = "2024-01-01T00:00:05.000001Z";
+    const { socket } = await play(
+      firstWindow([
+        leaf(a, "roll", "1"),
+        leaf(a, "pitch", "2"),
+        leaf(b, "roll", "3"),
+        leaf(b, "pitch", "4"),
+      ]),
+      writes(2),
+    );
+    assert.deepEqual(
+      socket.written.map((d) => [d.updates[0].timestamp, d.updates[0].values]),
+      [
+        [a, [{ path: ATT, value: { roll: 1, pitch: 2 } }]],
+        [b, [{ path: ATT, value: { roll: 3, pitch: 4 } }]],
+      ],
+    );
+  });
+
+  it("replays dotted leaves and positions unchanged", async () => {
+    const { socket } = await play(
+      firstWindow([
+        row(TS, `${ATT}.roll`, "self", "n2k.1", "0.1", "number"),
+        row(
+          TS,
+          "navigation.position",
+          "self",
+          "n2k.1",
+          "60.1,24.9",
+          "position",
+        ),
+      ]),
+      writes(1),
+    );
+    assert.equal(socket.written.length, 1);
+    assert.deepEqual(socket.written[0].updates[0].values, [
+      { path: `${ATT}.roll`, value: 0.1 },
+      {
+        path: "navigation.position",
+        value: { latitude: 60.1, longitude: 24.9 },
+      },
+    ]);
+  });
+
+  it("never splits a delta across a page boundary", async () => {
+    const filler = Array.from({ length: 9996 }, () =>
+      row("2024-01-01T00:00:01.000000Z", "a.b", "self", null, "1", "number"),
+    );
+    const a = "2024-01-01T00:00:05.000001Z";
+    const b = "2024-01-01T00:00:05.000002Z";
+    const deltaOf = (ts: string, source: string): unknown[][] => [
+      leaf(ts, "roll", "1", source),
+      leaf(ts, "pitch", "2", source),
+      leaf(ts, "yaw", "3", source),
+    ];
+    const first = [...filler, ...deltaOf(a, "a"), leaf(b, "roll", "1", "b")];
+    assert.equal(first.length, 10000);
+    const { f, socket } = await play((sql) => {
+      if (sql.includes("ts >= '2024-01-01T00:00:00.000Z'")) return first;
+      if (sql.includes("ts >= '2024-01-01T00:00:05.000Z'")) {
+        return [...deltaOf(a, "a"), ...deltaOf(b, "b")];
+      }
+      return [];
+    }, writes(3));
+    assert.ok(
+      f.sqls.filter(isWindow)[1].includes("ts >= '2024-01-01T00:00:05.000Z'"),
+    );
+    const objects = socket.written.filter((d) =>
+      d.updates[0].values.some((v) => v.path === ATT),
+    );
+    assert.deepEqual(
+      objects.map((d) => [d.updates[0].$source, d.updates[0].values]),
+      [
+        ["a", [{ path: ATT, value: { roll: 1, pitch: 2, yaw: 3 } }]],
+        ["b", [{ path: ATT, value: { roll: 1, pitch: 2, yaw: 3 } }]],
+      ],
+    );
+  });
+
+  it("keeps scalars and an object of one delta in one delta", async () => {
+    const { socket } = await play(
+      firstWindow([
+        row(TS, "a.b", "self", "n2k.1", "1", "number"),
+        leaf(TS, "roll", "1"),
+        row(TS, "c.d", "self", "n2k.1", "2", "number"),
+        leaf(TS, "pitch", "2"),
+      ]),
+      writes(1),
+    );
+    assert.equal(socket.written.length, 1);
+    assert.deepEqual(socket.written[0].updates[0].values, [
+      { path: "a.b", value: 1 },
+      { path: ATT, value: { roll: 1, pitch: 2 } },
+      { path: "c.d", value: 2 },
+    ]);
+  });
+});
+
+describe("object snapshot", () => {
+  const TS = "2024-01-01T00:00:02.000000Z";
+
+  it("merges each field's newest value, stamped with the newest ts", async () => {
+    const f = fixture(() => [
+      row(TS, "notifications.mob#/state", "self", "a", "emergency", null),
+      row(
+        "2024-01-01T00:00:01.000000Z",
+        "notifications.mob#/message",
+        "self",
+        "b",
+        "MOB",
+        null,
+      ),
+    ]);
+    const deltas = await snapshot(f);
+    assert.equal(deltas.length, 1);
+    const update = deltas[0].updates[0];
+    assert.equal(update.timestamp, TS);
+    assert.equal(update.$source, "a");
+    assert.deepEqual(update.values, [
+      {
+        path: "notifications.mob",
+        value: { state: "emergency", message: "MOB" },
+      },
+    ]);
+  });
+
+  it("stamps each context's object with that context's newest row", async () => {
+    const A = "vessels.urn:mrn:imo:mmsi:244813000";
+    const B = "vessels.urn:mrn:imo:mmsi:230000000";
+    const EARLY = "2024-01-01T00:00:01.000000Z";
+    const LATE = "2024-01-01T00:00:03.000000Z";
+    const deltas = await snapshot(
+      fixture(() => [
+        row(TS, "design.aisShipType#/id", A, "a1", "70", "number"),
+        row(EARLY, "design.aisShipType#/name", A, "a2", "Cargo", null),
+        row(EARLY, "design.aisShipType#/id", B, "b1", "36", "number"),
+        row(LATE, "design.aisShipType#/name", B, "b2", "Sailing", null),
+      ]),
+    );
+    assert.equal(deltas.length, 2);
+    const of = (context: string) => {
+      const delta = deltas.find((d) => d.context === context);
+      assert.ok(delta, context);
+      return delta.updates[0];
+    };
+    assert.equal(of(A).timestamp, TS);
+    assert.equal(of(A).$source, "a1");
+    assert.deepEqual(of(A).values, [
+      { path: "design.aisShipType", value: { id: 70, name: "Cargo" } },
+    ]);
+    assert.equal(of(B).timestamp, LATE);
+    assert.equal(of(B).$source, "b2");
+    assert.deepEqual(of(B).values, [
+      { path: "design.aisShipType", value: { id: 36, name: "Sailing" } },
+    ]);
+  });
+
+  it("unescapes field names and keeps __proto__ as data", async () => {
+    const deltas = await snapshot(
+      fixture(() => [
+        row(TS, "x.y#/a~1b~0c", "self", null, "1", "number"),
+        row(TS, "x.y#/__proto__", "self", null, "2", "number"),
+      ]),
+    );
+    const value = deltas[0].updates[0].values[0].value as Record<
+      string,
+      unknown
+    >;
+    assert.equal(deltas[0].updates[0].values[0].path, "x.y");
+    assert.deepEqual(Object.getOwnPropertyNames(value).sort(), [
+      "__proto__",
+      "a/b~c",
+    ]);
+    assert.equal(value["a/b~c"], 1);
+    assert.ok(Object.hasOwn(value, "__proto__"));
+    assert.equal(Object.getOwnPropertyDescriptor(value, "__proto__")?.value, 2);
+    assert.equal(Object.getPrototypeOf(value), Object.prototype);
+  });
+
+  it("keeps the number for a field in both tables", async () => {
+    const deltas = await snapshot(
+      fixture(() => [
+        row(TS, "x.y#/n", "self", null, "5", "number"),
+        row(TS, "x.y#/n", "self", null, "five", "string"),
+      ]),
+    );
+    assert.deepEqual(deltas[0].updates[0].values, [
+      { path: "x.y", value: { n: 5 } },
+    ]);
   });
 });
 
