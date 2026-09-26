@@ -101,22 +101,27 @@ With no default configured, the server uses whichever provider registered first.
 
 ### v2 (REST -- `/signalk/v2/api/history/`)
 
-Registered via `app.registerHistoryApiProvider()`. Supports all aggregate methods:
+Registered via `app.registerHistoryApiProvider()`. Numeric paths take every aggregate method:
 
-| Method    | QuestDB mapping                        |
-| --------- | -------------------------------------- |
-| `average` | `avg(value)`                           |
-| `min`     | `min(value)`                           |
-| `max`     | `max(value)`                           |
-| `first`   | `first(value)`                         |
-| `last`    | `last(value)`                          |
-| `mid`     | `(min + max) / 2`                      |
-| `sma`     | Client-side N-sample moving average    |
-| `ema`     | Client-side exponential moving average |
+| Method         | QuestDB mapping                                      |
+| -------------- | ---------------------------------------------------- |
+| `average`      | `avg(value)`                                         |
+| `min`          | `min(value)`                                         |
+| `max`          | `max(value)`                                         |
+| `first`        | `first(value)`                                       |
+| `last`         | `last(value)`                                        |
+| `mid`          | `(min + max) / 2`                                    |
+| `sma`          | Client-side N-sample moving average                  |
+| `ema`          | Client-side exponential moving average               |
+| `middle_index` | Client-side: the value at the middle of the raw read |
 
 `sma` reads its window and `ema` its alpha from a further colon-separated postfix (`navigation.speedOverGround:sma:10`). A window must be a whole number of at least 1, and an alpha must be within `0 < alpha <= 1`. Anything else, an absent parameter included, takes the default window of 5 or alpha of 0.2. The server strips `-`, `+` and spaces from `paths` before this plugin sees them, so a signed parameter arrives unsigned: `ema:-0.5` is read as an alpha of 0.5 rather than taking the default.
 
 Both are computed here rather than by QuestDB, over raw samples. `resolution` does not bucket them: those columns come back at storage density, up to 50000 points per path.
+
+An unknown method name fails the request with `Unknown aggregate <name>: use average, min, max, first, last, mid, middle_index, sma or ema`.
+
+**Text values** (strings and booleans) and **`navigation.position`** only take the methods that pick a recorded value: `first`, `last` and `middle_index`. With `resolution`, `average`, `min`, `max` and `mid` fail the request with `Aggregate average does not apply to text path navigation.state: use first, last or middle_index` (or `position path` for `navigation.position`), and `sma` and `ema` fail with or without it. Without `resolution` every other method returns the recorded values, as it does for numbers. The server fills in `first` for `navigation.position` and `average` for every other path when a request names no method, so a text path requested with a `resolution` and no method now fails.
 
 **Object values** come back as objects. Ask for the object's own path, `paths=navigation.attitude:last`, and each bucket holds `{ "roll": ..., "pitch": ..., "yaw": ... }`; `/paths` lists `navigation.attitude` once. An aggregate applies to the object as a whole, so an object path only takes the methods that pick a recorded delta:
 

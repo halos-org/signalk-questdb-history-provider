@@ -396,9 +396,12 @@ describe("context handling", () => {
 });
 
 describe("position path", () => {
-  const position = (aggregate: string): history.ValuesRequest =>
+  const position = (
+    aggregate: string,
+    over: Record<string, unknown> = { resolution: 60 },
+  ): history.ValuesRequest =>
     request({
-      resolution: 60,
+      ...over,
       pathSpecs: [
         spec({
           path: "navigation.position",
@@ -423,17 +426,57 @@ describe("position path", () => {
     );
   });
 
-  for (const aggregate of ["average", "min", "max", "mid", "middle_index"]) {
-    it(`uses first for ${aggregate} and reports the requested method`, async () => {
+  const positionRefusal = (aggregate: string): { message: string } => ({
+    message: `Aggregate ${aggregate} does not apply to position path navigation.position: use first, last or middle_index`,
+  });
+
+  for (const aggregate of ["average", "min", "max", "mid"]) {
+    it(`refuses a downsampled ${aggregate} before any SQL`, async () => {
       const f = fixture();
-      const r = await f.provider.getValues(position(aggregate));
-      assert.ok(
-        f.sqls[0].includes("first(lat)") && f.sqls[0].includes("first(lon)"),
+      await assert.rejects(
+        f.provider.getValues(position(aggregate)),
+        positionRefusal(aggregate),
       );
-      assert.equal(f.sqls.length, 1);
-      assert.equal(r.values[0].method, aggregate);
+      assert.equal(f.sqls.length, 0);
     });
   }
+
+  for (const aggregate of ["sma", "ema"]) {
+    it(`refuses ${aggregate} without a resolution`, async () => {
+      const f = fixture();
+      await assert.rejects(
+        f.provider.getValues(position(aggregate, {})),
+        positionRefusal(aggregate),
+      );
+      assert.equal(f.sqls.length, 0);
+    });
+  }
+
+  it("reads raw fixes for average without a resolution", async () => {
+    const f = fixture();
+    const r = await f.provider.getValues(position("average", {}));
+    assert.equal(f.sqls.length, 1);
+    assert.ok(f.sqls[0].includes("ORDER BY ts LIMIT 10000"), f.sqls[0]);
+    assert.ok(!f.sqls[0].includes("first("), f.sqls[0]);
+    assert.equal(r.values[0].method, "average");
+  });
+
+  it("keeps the middle fix for middle_index, ignoring the resolution", async () => {
+    const f = fixture(() => [
+      ["2024-01-01T00:00:01.000000Z", 60.1, 24.9],
+      ["2024-01-01T00:00:02.000000Z", 60.2, 24.8],
+      ["2024-01-01T00:00:03.000000Z", 60.3, 24.7],
+    ]);
+    const r = await f.provider.getValues(position("middle_index"));
+    assert.equal(f.sqls.length, 1);
+    assert.ok(f.sqls[0].includes("ORDER BY ts LIMIT 50000"), f.sqls[0]);
+    assert.ok(!f.sqls[0].includes("SAMPLE BY"), f.sqls[0]);
+    assert.deepEqual(r.data, [
+      ["2024-01-01T00:00:01.000000Z", null],
+      ["2024-01-01T00:00:02.000000Z", { latitude: 60.2, longitude: 24.8 }],
+      ["2024-01-01T00:00:03.000000Z", null],
+    ]);
+  });
 
   it("decodes rows into position objects and nulls", async () => {
     const f = fixture(() => [
@@ -624,17 +667,50 @@ describe("string-table fallback", () => {
     assert.deepEqual(r.data, [["2024-01-01T00:00:00.000000Z", "false"]]);
   });
 
-  it("reports last when downsampled and falling back", async () => {
-    const f = fixture((sql) =>
-      sql.includes("signalk_str") ? [[TS, "on"]] : [],
+  const textRefusal = (aggregate: string): { message: string } => ({
+    message: `Aggregate ${aggregate} does not apply to text path navigation.state: use first, last or middle_index`,
+  });
+  const isProbe = (sql: string): boolean =>
+    sql.startsWith("SELECT ts FROM signalk_str") && sql.endsWith("LIMIT 1");
+
+  it("refuses a downsampled average on a text path after probing", async () => {
+    const f = fixture((sql) => (isProbe(sql) ? [[TS]] : []));
+    await assert.rejects(
+      f.provider.getValues(
+        self(
+          { resolution: 600 },
+          { path: "navigation.state", aggregate: "average" },
+        ),
+      ),
+      textRefusal("average"),
     );
+    assert.equal(f.sqls.length, 2);
+    assert.ok(f.sqls[0].includes("agg_value"));
+    assert.ok(isProbe(f.sqls[1]), f.sqls[1]);
+  });
+
+  for (const aggregate of ["min", "max", "mid"]) {
+    it(`refuses a downsampled ${aggregate} on a text path`, async () => {
+      const f = fixture((sql) => (isProbe(sql) ? [[TS]] : []));
+      await assert.rejects(
+        f.provider.getValues(
+          self({ resolution: 600 }, { path: "navigation.state", aggregate }),
+        ),
+        textRefusal(aggregate),
+      );
+    });
+  }
+
+  it("answers an empty column for a downsampled average with no rows", async () => {
+    const f = fixture(() => []);
     const r = await f.provider.getValues(
       self(
         { resolution: 600 },
         { path: "navigation.state", aggregate: "average" },
       ),
     );
-    assert.equal(r.values[0].method, "last");
+    assert.deepEqual(r.data, []);
+    assert.equal(r.values[0].method, "average");
   });
 
   it("keeps the requested method when raw", async () => {
@@ -682,17 +758,21 @@ describe("string-table fallback", () => {
     assert.equal(f.sqls.filter((s) => s.includes("signalk_str")).length, 1);
   });
 
-  it("uses last() in the downsampled string query", async () => {
-    const f = fixture((sql) =>
-      sql.includes("signalk_str") ? [[TS, "on"]] : [],
-    );
-    await f.provider.getValues(
-      self({ resolution: 600 }, { path: "navigation.state" }),
-    );
-    const stringSql = f.sqls.find((s) => s.includes("signalk_str"))!;
-    assert.ok(stringSql.includes("last(value_str)"));
-    assert.ok(!stringSql.includes("avg("));
-  });
+  for (const aggregate of ["first", "last"]) {
+    it(`uses ${aggregate}() in the downsampled string query`, async () => {
+      const f = fixture((sql) =>
+        sql.includes("signalk_str") ? [[TS, "on"]] : [],
+      );
+      const r = await f.provider.getValues(
+        self({ resolution: 600 }, { path: "navigation.state", aggregate }),
+      );
+      const stringSql = f.sqls.find((s) => s.includes("signalk_str"))!;
+      assert.ok(stringSql.includes(`${aggregate}(value_str)`), stringSql);
+      assert.ok(stringSql.includes(`${aggregate}(value_kind)`), stringSql);
+      assert.ok(!stringSql.includes("avg("));
+      assert.equal(r.values[0].method, aggregate);
+    });
+  }
 });
 
 describe("path and context discovery", () => {
@@ -989,6 +1069,59 @@ describe("source policy", () => {
   });
 });
 
+describe("client-side aggregates on a text path", () => {
+  const T1 = "2024-01-01T00:00:01.000000Z";
+  const T2 = "2024-01-01T00:00:02.000000Z";
+  const T3 = "2024-01-01T00:00:03.000000Z";
+  const isQ3 = (sql: string): boolean =>
+    sql.startsWith("SELECT ts, value FROM signalk") && sql.endsWith("50000");
+  const isProbe = (sql: string): boolean =>
+    sql.startsWith("SELECT ts FROM signalk_str") && sql.endsWith("LIMIT 1");
+  const isQ21 = (sql: string): boolean =>
+    sql.startsWith("SELECT ts, value_str, value_kind FROM signalk_str") &&
+    sql.endsWith("ORDER BY ts LIMIT 50000");
+  const text = (sql: string): unknown[][] => {
+    if (isQ3(sql)) return [];
+    if (isProbe(sql)) return [[T1]];
+    if (isQ21(sql))
+      return [
+        [T1, "a", null],
+        [T2, "true", "boolean"],
+        [T3, "c", null],
+      ];
+    return [];
+  };
+  const ask = (aggregate: string): history.ValuesRequest =>
+    request({
+      context: "self",
+      pathSpecs: [spec({ path: "navigation.state", aggregate })],
+    });
+
+  for (const aggregate of ["sma", "ema"]) {
+    it(`refuses ${aggregate}`, async () => {
+      const f = fixture(text);
+      await assert.rejects(f.provider.getValues(ask(aggregate)), {
+        message: `Aggregate ${aggregate} does not apply to text path navigation.state: use first, last or middle_index`,
+      });
+      assert.ok(!f.sqls.some(isQ21));
+    });
+  }
+
+  it("keeps the middle text value for middle_index", async () => {
+    const f = fixture(text);
+    const r = await f.provider.getValues(ask("middle_index"));
+    assert.equal(f.sqls.length, 3);
+    assert.ok(isQ3(f.sqls[0]), f.sqls[0]);
+    assert.ok(isProbe(f.sqls[1]), f.sqls[1]);
+    assert.ok(isQ21(f.sqls[2]), f.sqls[2]);
+    assert.deepEqual(r.data, [
+      [T1, null],
+      [T2, true],
+      [T3, null],
+    ]);
+  });
+});
+
 describe("client-side aggregate parameters", () => {
   const rows = (values: (number | null)[]): unknown[][] =>
     values.map((v, i) => [`2024-01-01T00:00:0${i + 1}.000000Z`, v]);
@@ -1151,25 +1284,44 @@ describe("README invariant", () => {
 });
 
 describe("aggregate names", () => {
-  it("treats an inherited object property name as unknown", async () => {
-    const f = fixture(() => [["2024-01-01T00:00:00.000000Z", 1]]);
-    await f.provider.getValues(
-      request({
-        resolution: 60,
-        pathSpecs: [spec({ aggregate: "constructor" })],
-      }),
-    );
-    assert.ok(f.sqls[0].includes("avg(value)"), f.sqls[0]);
-    assert.ok(!f.sqls[0].includes("function"), f.sqls[0]);
+  const unknown = (aggregate: string): { message: string } => ({
+    message: `Unknown aggregate ${aggregate}: use average, min, max, first, last, mid, middle_index, sma or ema`,
   });
 
-  it("runs the average for an unknown name and reports the name", async () => {
+  it("rejects an inherited object property name as unknown", async () => {
     const f = fixture(() => [["2024-01-01T00:00:00.000000Z", 1]]);
-    const result = await f.provider.getValues(
-      request({ resolution: 60, pathSpecs: [spec({ aggregate: "bogus" })] }),
+    await assert.rejects(
+      f.provider.getValues(
+        request({
+          resolution: 60,
+          pathSpecs: [spec({ aggregate: "constructor" })],
+        }),
+      ),
+      unknown("constructor"),
     );
-    assert.ok(f.sqls[0].includes("avg(value)"), f.sqls[0]);
-    assert.equal(result.values[0].method, "bogus");
+    assert.equal(f.sqls.length, 0);
+  });
+
+  it("rejects an unknown name without a resolution", async () => {
+    const f = fixture(() => [["2024-01-01T00:00:00.000000Z", 1]]);
+    await assert.rejects(
+      f.provider.getValues(
+        request({ pathSpecs: [spec({ aggregate: "bogus" })] }),
+      ),
+      unknown("bogus"),
+    );
+    assert.equal(f.sqls.length, 0);
+  });
+
+  it("rejects the second specification after the first one's SQL", async () => {
+    const f = fixture(() => [["2024-01-01T00:00:00.000000Z", 1]]);
+    await assert.rejects(
+      f.provider.getValues(
+        request({ pathSpecs: [spec(), spec({ aggregate: "bogus" })] }),
+      ),
+      unknown("bogus"),
+    );
+    assert.equal(f.sqls.length, 1);
   });
 });
 
@@ -1269,11 +1421,11 @@ describe("object-valued paths", () => {
     await assert.rejects(f.provider.getValues(attitude()), refusal("average"));
     assert.equal(f.sqls.length, 3);
     assert.ok(f.sqls[0].includes("agg_value"));
-    assert.ok(f.sqls[1].includes("last(value_str) as value_str"));
+    assert.ok(f.sqls[1].startsWith("SELECT ts FROM signalk_str"), f.sqls[1]);
     assert.ok(isDiscovery(f.sqls[2]));
   });
 
-  for (const aggregate of ["min", "max", "mid", "bogus", "constructor"]) {
+  for (const aggregate of ["min", "max", "mid"]) {
     it(`refuses ${aggregate} on an object path`, async () => {
       const f = objects();
       await assert.rejects(
@@ -1527,8 +1679,9 @@ describe("object-valued paths", () => {
     const f = objects({ discover: [] });
     const r = await f.provider.getValues(attitude());
     assert.equal(f.sqls.length, 3);
+    assert.ok(f.sqls[1].startsWith("SELECT ts FROM signalk_str"), f.sqls[1]);
     assert.deepEqual(r.data, []);
-    assert.equal(r.values[0].method, "last");
+    assert.equal(r.values[0].method, "average");
   });
 
   it("discovers once per request", async () => {
@@ -1559,7 +1712,7 @@ describe("object-valued paths", () => {
       q4: [[B0, "on", null]],
       q13: [[B0, ROLL, 1, T1]],
     });
-    const r = await f.provider.getValues(attitude());
+    const r = await f.provider.getValues(attitude({ aggregate: "last" }));
     assert.equal(f.sqls.length, 2);
     assert.deepEqual(r.data, [[B0, "on"]]);
   });
@@ -1821,11 +1974,12 @@ describe("object-valued paths", () => {
     );
   });
 
-  it("leaves a client-side column empty when scalar text rows exist", async () => {
+  it("refuses a client-side sma when scalar text rows exist", async () => {
     const f = objects({ q17: [[B0]], q15: [[T1, "a", ROLL, 1]] });
-    const r = await f.provider.getValues(attitude({ aggregate: "sma" }));
+    await assert.rejects(f.provider.getValues(attitude({ aggregate: "sma" })), {
+      message: `Aggregate sma does not apply to text path ${P}: use first, last or middle_index`,
+    });
     assert.equal(f.sqls.length, 2);
-    assert.deepEqual(r.data, []);
   });
 
   it("keeps a numeric client-side column", async () => {
