@@ -516,12 +516,17 @@ export function simpleMovingAverage(
     Number.isInteger(parameter) && parameter >= 1
       ? parameter
       : SMA_DEFAULT_WINDOW;
-  const recent: number[] = [];
+  // A running sum over the non-null values, so the cost is linear in the
+  // series whatever window the caller asks for.
+  const seen: number[] = [];
+  let oldest = 0;
+  let sum = 0;
   return values.map((value) => {
     if (value === null) return null;
-    recent.push(value);
-    if (recent.length > window) recent.shift();
-    return recent.reduce((sum, v) => sum + v, 0) / recent.length;
+    seen.push(value);
+    sum += value;
+    if (seen.length - oldest > window) sum -= seen[oldest++];
+    return sum / (seen.length - oldest);
   });
 }
 

@@ -13,6 +13,7 @@ import {
   EMA_DEFAULT_ALPHA,
   SMA_DEFAULT_WINDOW,
   createHistoryApiProvider,
+  simpleMovingAverage,
 } from "../history/v2.js";
 
 const SELF = "vessels.urn:mrn:imo:mmsi:123456789";
@@ -1325,6 +1326,10 @@ describe("client-side aggregate parameters", () => {
   });
 });
 
+// Linear smoothing of 200,000 points takes milliseconds; the per-point window
+// sum took 37 s on a development machine.
+const LINEAR_SMOOTHING_BUDGET_MS = 1000;
+
 describe("downsampled moving averages", () => {
   const buckets = [
     "2024-01-01T00:00:00.000000Z",
@@ -1390,6 +1395,18 @@ describe("downsampled moving averages", () => {
       r.data.map((row) => row[1]),
       [0, 0, 5, 12.5],
     );
+  });
+
+  // The guard admits a million buckets and the window is the caller's. Timed
+  // rather than given a test timeout: the smoothing is synchronous, so a
+  // timeout could not fire until it had finished.
+  it("smooths sma in time linear in the bucket count", () => {
+    const count = 200_000;
+    const values = Array.from({ length: count }, (_, i) => i);
+    const started = performance.now();
+    const smoothed = simpleMovingAverage(values, count / 2);
+    assert.ok(performance.now() - started < LINEAR_SMOOTHING_BUDGET_MS);
+    assert.equal(smoothed[count - 1], (count / 2 + count - 1) / 2);
   });
 
   for (const aggregate of ["sma", "ema"]) {
