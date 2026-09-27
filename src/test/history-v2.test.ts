@@ -13,6 +13,7 @@ import {
   EMA_DEFAULT_ALPHA,
   SMA_DEFAULT_WINDOW,
   createHistoryApiProvider,
+  simpleMovingAverage,
 } from "../history/v2.js";
 
 const SELF = "vessels.urn:mrn:imo:mmsi:123456789";
@@ -577,6 +578,23 @@ describe("sample bucket guard", () => {
     assert.deepEqual(f.sqls, []);
   });
 
+  for (const [aggregate, parameter] of [
+    ["average", []],
+    ["sma", ["5"]],
+  ] as const) {
+    it(`budgets one ${aggregate} spec once at 1 s over a week`, async () => {
+      const f = fixture();
+      await f.provider.getValues(
+        request({
+          ...oneWeek,
+          resolution: 1,
+          pathSpecs: [spec({ aggregate, parameter: [...parameter] })],
+        }),
+      );
+      assert.ok(f.sqls.length >= 1);
+    });
+  }
+
   it("rejects one fallback-capable spec at 1 s over a week", async () => {
     const f = fixture();
     await assert.rejects(
@@ -622,27 +640,41 @@ describe("sample bucket guard", () => {
     assert.ok(f.sqls.length >= 1);
   });
 
+  it("never counts middle_index and reads raw rows", async () => {
+    const f = fixture();
+    await f.provider.getValues(
+      request({
+        ...twoMonths,
+        resolution: 1,
+        pathSpecs: [spec({ aggregate: "middle_index", parameter: [] })],
+      }),
+    );
+    assert.equal(f.sqls.length, 3);
+    assert.ok(f.sqls[0].includes("LIMIT 50000"));
+    assert.ok(
+      f.sqls[1].includes("FROM signalk_str") && f.sqls[1].endsWith("LIMIT 1"),
+    );
+    assert.ok(f.sqls[2].includes("SELECT DISTINCT path, 'signalk' tbl"));
+    assert.ok(f.sqls.every((s) => !s.includes("SAMPLE BY")));
+  });
+
   for (const [aggregate, parameter] of [
     ["sma", ["5"]],
     ["ema", ["0.2"]],
-    ["middle_index", []],
   ] as const) {
-    it(`never counts ${aggregate} and reads raw rows`, async () => {
+    it(`counts a downsampled ${aggregate}`, async () => {
       const f = fixture();
-      await f.provider.getValues(
-        request({
-          ...twoMonths,
-          resolution: 1,
-          pathSpecs: [spec({ aggregate, parameter: [...parameter] })],
-        }),
+      await assert.rejects(
+        f.provider.getValues(
+          request({
+            ...twoMonths,
+            resolution: 1,
+            pathSpecs: [spec({ aggregate, parameter: [...parameter] })],
+          }),
+        ),
+        /sample buckets/,
       );
-      assert.equal(f.sqls.length, 3);
-      assert.ok(f.sqls[0].includes("LIMIT 50000"));
-      assert.ok(
-        f.sqls[1].includes("FROM signalk_str") && f.sqls[1].endsWith("LIMIT 1"),
-      );
-      assert.ok(f.sqls[2].includes("SELECT DISTINCT path, 'signalk' tbl"));
-      assert.ok(f.sqls.every((s) => !s.includes("SAMPLE BY")));
+      assert.equal(f.sqls.length, 0);
     });
   }
 });
@@ -1111,7 +1143,7 @@ describe("source policy", () => {
     const f = fixture((sql) => (isQ18(sql) ? sources : []));
     await assert.rejects(
       f.provider.getValues(
-        all([spec()], {
+        all([spec({ aggregate: "first" })], {
           to: I("2024-01-02T00:00:00Z"),
           resolution: 1,
         }),
@@ -1309,6 +1341,108 @@ describe("client-side aggregate parameters", () => {
     assert.deepEqual(r.data, []);
     assert.ok(f.sqls.every((s) => !s.includes("SELECT ts, value_str")));
   });
+});
+
+// Linear smoothing of 200,000 points takes milliseconds; the per-point window
+// sum took 37 s on a development machine.
+const LINEAR_SMOOTHING_BUDGET_MS = 1000;
+
+describe("downsampled moving averages", () => {
+  const buckets = [
+    "2024-01-01T00:00:00.000000Z",
+    "2024-01-01T00:01:00.000000Z",
+    "2024-01-01T00:02:00.000000Z",
+    "2024-01-01T00:03:00.000000Z",
+  ];
+  const q1 = (values: (number | null)[]): unknown[][] =>
+    values.map((v, i) => [buckets[i], v]);
+  const isQ1 = (sql: string): boolean =>
+    sql.startsWith("SELECT ts, avg(value) as agg_value FROM signalk WHERE") &&
+    sql.endsWith("SAMPLE BY 60s FILL(NULL) ORDER BY ts");
+  const ask = (
+    aggregate: string,
+    parameter: string[],
+    path = "navigation.speedOverGround",
+  ): history.ValuesRequest =>
+    request({
+      context: "self",
+      resolution: 60,
+      pathSpecs: [spec({ path, aggregate, parameter })],
+    });
+
+  it("smooths sma over the bucket averages", async () => {
+    const f = fixture(() => q1([0, 10, 20, 30]));
+    const r = await f.provider.getValues(ask("sma", ["2"]));
+    assert.equal(f.sqls.length, 1);
+    assert.ok(isQ1(f.sqls[0]), f.sqls[0]);
+    assert.deepEqual(r.data, [
+      [buckets[0], 0],
+      [buckets[1], 5],
+      [buckets[2], 15],
+      [buckets[3], 25],
+    ]);
+    assert.equal(r.values[0].method, "sma");
+  });
+
+  it("smooths ema over the bucket averages", async () => {
+    const f = fixture(() => q1([0, 10, 20, 30]));
+    const r = await f.provider.getValues(ask("ema", ["0.5"]));
+    assert.equal(f.sqls.length, 1);
+    assert.ok(isQ1(f.sqls[0]), f.sqls[0]);
+    assert.deepEqual(
+      r.data.map((row) => row[1]),
+      [0, 5, 12.5, 21.25],
+    );
+    assert.equal(r.values[0].method, "ema");
+  });
+
+  it("sma emits null for an empty bucket", async () => {
+    const f = fixture(() => q1([0, 10, null, 30]));
+    const r = await f.provider.getValues(ask("sma", ["2"]));
+    assert.deepEqual(
+      r.data.map((row) => row[1]),
+      [0, 5, null, 20],
+    );
+  });
+
+  it("ema repeats its previous value for an empty bucket", async () => {
+    const f = fixture(() => q1([0, null, 10, 20]));
+    const r = await f.provider.getValues(ask("ema", ["0.5"]));
+    assert.deepEqual(
+      r.data.map((row) => row[1]),
+      [0, 0, 5, 12.5],
+    );
+  });
+
+  // The guard admits a million buckets and the window is the caller's. Timed
+  // rather than given a test timeout: the smoothing is synchronous, so a
+  // timeout could not fire until it had finished.
+  it("smooths sma in time linear in the bucket count", () => {
+    const count = 200_000;
+    const values = Array.from({ length: count }, (_, i) => i);
+    const started = performance.now();
+    const smoothed = simpleMovingAverage(values, count / 2);
+    assert.ok(performance.now() - started < LINEAR_SMOOTHING_BUDGET_MS);
+    assert.equal(smoothed[count - 1], (count / 2 + count - 1) / 2);
+  });
+
+  for (const aggregate of ["sma", "ema"]) {
+    it(`refuses a downsampled ${aggregate} on a text path`, async () => {
+      const f = fixture((sql) =>
+        sql.startsWith("SELECT ts FROM signalk_str")
+          ? [[buckets[0]]]
+          : q1([null, null, null, null]),
+      );
+      await assert.rejects(
+        f.provider.getValues(ask(aggregate, [], "navigation.state")),
+        {
+          message: `Aggregate ${aggregate} does not apply to text path navigation.state: use first, last or middle_index`,
+        },
+      );
+      assert.equal(f.sqls.length, 2);
+      assert.ok(isQ1(f.sqls[0]), f.sqls[0]);
+    });
+  }
 });
 
 describe("assembling data", () => {
@@ -1971,7 +2105,8 @@ describe("object-valued paths", () => {
       refusal("sma"),
     );
     assert.equal(f.sqls.length, 3);
-    assert.ok(f.sqls[0].includes("LIMIT 50000"), f.sqls[0]);
+    assert.ok(f.sqls[0].includes("avg(value) as agg_value"), f.sqls[0]);
+    assert.ok(f.sqls[0].includes("SAMPLE BY 60s"), f.sqls[0]);
     assert.equal(
       f.sqls[1],
       `SELECT ts FROM signalk_str WHERE ts >= '2024-01-01T00:00:00.000Z' AND ts <= '2024-01-01T01:00:00.000Z' AND context = 'self' AND path = '${P}' LIMIT 1`,
@@ -2055,7 +2190,7 @@ describe("object-valued paths", () => {
     );
   });
 
-  it("refuses a client-side sma when scalar text rows exist", async () => {
+  it("refuses a downsampled sma when scalar text rows exist", async () => {
     const f = objects({ q17: [[B0]], q15: [[T1, "a", ROLL, 1]] });
     await assert.rejects(f.provider.getValues(attitude({ aggregate: "sma" })), {
       message: `Aggregate sma does not apply to text path ${P}: use first, last or middle_index`,
@@ -2063,8 +2198,8 @@ describe("object-valued paths", () => {
     assert.equal(f.sqls.length, 2);
   });
 
-  it("keeps a numeric client-side column", async () => {
-    const f = objects({ q3: [[B0, 4]] });
+  it("keeps a numeric downsampled sma column", async () => {
+    const f = objects({ q1: [[B0, 4]] });
     const r = await f.provider.getValues(attitude({ aggregate: "sma" }));
     assert.equal(f.sqls.length, 1);
     assert.deepEqual(r.data, [[B0, 4]]);

@@ -111,13 +111,13 @@ Registered via `app.registerHistoryApiProvider()`. Numeric paths take every aggr
 | `first`        | `first(value)`                                       |
 | `last`         | `last(value)`                                        |
 | `mid`          | `(min + max) / 2`                                    |
-| `sma`          | Client-side N-sample moving average                  |
+| `sma`          | Client-side N-point moving average                   |
 | `ema`          | Client-side exponential moving average               |
 | `middle_index` | Client-side: the value at the middle of the raw read |
 
 `sma` reads its window and `ema` its alpha from a further colon-separated postfix (`navigation.speedOverGround:sma:10`). A window must be a whole number of at least 1, and an alpha must be within `0 < alpha <= 1`. Anything else, an absent parameter included, takes the default window of 5 or alpha of 0.2. The server strips `-`, `+` and spaces from `paths` before this plugin sees them, so a signed parameter arrives unsigned: `ema:-0.5` is read as an alpha of 0.5 rather than taking the default.
 
-Both are computed here rather than by QuestDB, over raw samples. `resolution` does not bucket them: those columns come back at storage density, up to 50000 points per path.
+Both are computed here rather than by QuestDB. With `resolution`, QuestDB averages each bucket (`avg(value)`) and the moving average runs over those bucket values, so the window counts buckets and the column has one point per bucket. Without `resolution` it runs over the raw samples, up to 50000 per path.
 
 An unknown method name fails the request with `Unknown aggregate <name>: use average, min, max, first, last, mid, middle_index, sma or ema`.
 

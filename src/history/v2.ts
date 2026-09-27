@@ -22,6 +22,8 @@ export const EMA_DEFAULT_ALPHA = 0.2;
 const POSITION_PATH = "navigation.position";
 const SELF_ALIASES = new Set(["self", "vessels.self"]);
 const CLIENT_SIDE_AGGREGATES = new Set(["middle_index", "sma", "ema"]);
+/** Downsampled, these smooth the bucket averages rather than raw rows. */
+const SMOOTHING_AGGREGATES = new Set(["sma", "ema"]);
 /** The aggregates that pick a recorded value rather than compute one. */
 const SELECTING_AGGREGATES = new Set(["first", "last", "middle_index"]);
 
@@ -136,8 +138,7 @@ export function createHistoryApiProvider(
       if (spec.path === POSITION_PATH) {
         column = await positionColumn(`${contextWhere}${source}`, spec, period);
       } else {
-        const client = CLIENT_SIDE_AGGREGATES.has(spec.aggregate);
-        const scalar = client
+        const scalar = readsRaw(spec.aggregate, period)
           ? await clientSideColumn(pathWhere, spec)
           : await numericColumn(pathWhere, spec, period);
         column = scalar.column;
@@ -281,15 +282,24 @@ export function createHistoryApiProvider(
     spec: history.PathSpec,
     period: number,
   ): Promise<ScalarColumn> {
-    const aggregate = SQL_AGGREGATES[spec.aggregate];
+    const smoothing = SMOOTHING_AGGREGATES.has(spec.aggregate);
+    const aggregate = SQL_AGGREGATES[smoothing ? "average" : spec.aggregate];
     const numericSql =
       period > 0
         ? `SELECT ts, ${aggregate} as agg_value FROM signalk WHERE ${where} SAMPLE BY ${period}s FILL(NULL) ORDER BY ts`
         : `SELECT ts, value FROM signalk WHERE ${where} ORDER BY ts LIMIT ${RAW_ROW_LIMIT}`;
     const numericRows = await query(numericSql);
     if (numericRows.some(([, value]) => value != null)) {
+      const values = smoothing
+        ? smooth(
+            spec,
+            numericRows.map(([, value]) =>
+              typeof value === "number" ? value : null,
+            ),
+          )
+        : numericRows.map(([, value]) => value);
       return {
-        column: new Map(numericRows.map(([ts, value]) => [String(ts), value])),
+        column: new Map(numericRows.map(([ts], i) => [String(ts), values[i]])),
         empty: false,
       };
     }
@@ -390,10 +400,15 @@ function guardSampleBuckets(
   resolution: number | undefined,
   range: ResolvedRange,
 ): void {
+  // The guard runs only for a downsampled request, where sma and ema read
+  // buckets, so middle_index is the one aggregate it never counts.
   const isSampled = (s: history.PathSpec): boolean =>
-    !CLIENT_SIDE_AGGREGATES.has(s.aggregate);
+    s.aggregate !== "middle_index";
+  // Only first and last follow an empty numeric read with a sampled string
+  // query; every other aggregate probes with a one-row Q17.
   const isFallbackCapable = (s: history.PathSpec): boolean =>
-    s.path !== POSITION_PATH && !CLIENT_SIDE_AGGREGATES.has(s.aggregate);
+    s.path !== POSITION_PATH &&
+    (s.aggregate === "first" || s.aggregate === "last");
   const sampledCount = specs.filter(isSampled).length;
   const fallbackCount = specs.filter(isFallbackCapable).length;
   if (
@@ -412,6 +427,12 @@ function guardSampleBuckets(
       `resolution ${resolution}s over this range produces up to ${buckets} sample buckets across ${sampledCount} paths (max ${MAX_SAMPLE_BUCKETS}) — use a coarser resolution or a shorter range`,
     );
   }
+}
+
+/** Whether the provider computes this aggregate over raw rows. */
+function readsRaw(aggregate: string, period: number): boolean {
+  if (SMOOTHING_AGGREGATES.has(aggregate)) return period === 0;
+  return CLIENT_SIDE_AGGREGATES.has(aggregate);
 }
 
 function storedSource(source: unknown): string | null {
@@ -498,12 +519,17 @@ export function simpleMovingAverage(
     Number.isInteger(parameter) && parameter >= 1
       ? parameter
       : SMA_DEFAULT_WINDOW;
-  const recent: number[] = [];
+  // A running sum over the non-null values, so the cost is linear in the
+  // series whatever window the caller asks for.
+  const seen: number[] = [];
+  let oldest = 0;
+  let sum = 0;
   return values.map((value) => {
     if (value === null) return null;
-    recent.push(value);
-    if (recent.length > window) recent.shift();
-    return recent.reduce((sum, v) => sum + v, 0) / recent.length;
+    seen.push(value);
+    sum += value;
+    if (seen.length - oldest > window) sum -= seen[oldest++];
+    return sum / (seen.length - oldest);
   });
 }
 
