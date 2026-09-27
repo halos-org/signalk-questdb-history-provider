@@ -404,8 +404,11 @@ function guardSampleBuckets(
   // buckets, so middle_index is the one aggregate it never counts.
   const isSampled = (s: history.PathSpec): boolean =>
     s.aggregate !== "middle_index";
+  // Only first and last follow an empty numeric read with a sampled string
+  // query; every other aggregate probes with a one-row Q17.
   const isFallbackCapable = (s: history.PathSpec): boolean =>
-    s.path !== POSITION_PATH && isSampled(s);
+    s.path !== POSITION_PATH &&
+    (s.aggregate === "first" || s.aggregate === "last");
   const sampledCount = specs.filter(isSampled).length;
   const fallbackCount = specs.filter(isFallbackCapable).length;
   if (

@@ -578,6 +578,23 @@ describe("sample bucket guard", () => {
     assert.deepEqual(f.sqls, []);
   });
 
+  for (const [aggregate, parameter] of [
+    ["average", []],
+    ["sma", ["5"]],
+  ] as const) {
+    it(`budgets one ${aggregate} spec once at 1 s over a week`, async () => {
+      const f = fixture();
+      await f.provider.getValues(
+        request({
+          ...oneWeek,
+          resolution: 1,
+          pathSpecs: [spec({ aggregate, parameter: [...parameter] })],
+        }),
+      );
+      assert.ok(f.sqls.length >= 1);
+    });
+  }
+
   it("rejects one fallback-capable spec at 1 s over a week", async () => {
     const f = fixture();
     await assert.rejects(
@@ -1126,7 +1143,7 @@ describe("source policy", () => {
     const f = fixture((sql) => (isQ18(sql) ? sources : []));
     await assert.rejects(
       f.provider.getValues(
-        all([spec()], {
+        all([spec({ aggregate: "first" })], {
           to: I("2024-01-02T00:00:00Z"),
           resolution: 1,
         }),
